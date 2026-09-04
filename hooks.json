@@ -1,0 +1,17 @@
+{
+  "agy-auto-mode": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 scripts/permission_classifier.py",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}

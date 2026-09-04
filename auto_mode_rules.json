@@ -1,0 +1,23 @@
+{
+  "environment": [
+    "Primary use: software development and coding assistance",
+    "Sensitive paths: ~/.ssh, ~/.aws, ~/.gnupg, /etc, /System, /usr/bin, /usr/sbin, /bin, /sbin"
+  ],
+  "allow": [
+    "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
+    "Code modifications to files located strictly within trusted workspaces",
+    "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc",
+    "Routine git queries and local non-destructive operations: git status, diff, log, branch, add, commit, checkout, stash"
+  ],
+  "soft_deny": [
+    "File deletions or recursive directory removals (rm, rm -rf, shred)",
+    "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
+    "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f",
+    "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
+    "Modifications targeting sensitive system paths or files outside workspace roots"
+  ],
+  "hard_deny": [
+    "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
+    "Catastrophic system destruction: wiping root filesystem, formatting disk partitions, raw device writes"
+  ]
+}
