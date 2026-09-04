@@ -57,7 +57,25 @@ mkdir -p "${DEST_DIR}/rules"
 mkdir -p "${DEST_DIR}/skills/auto-mode"
 
 cp "${REPO_DIR}/plugin.json" "${DEST_DIR}/"
-cp "${REPO_DIR}/hooks.json" "${DEST_DIR}/"
+cat <<EOF > "${DEST_DIR}/hooks.json"
+{
+  "agy-auto-mode": {
+    "enabled": true,
+    "PreToolUse": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ${DEST_DIR}/scripts/permission_classifier.py",
+            "timeout": 8
+          }
+        ]
+      }
+    ]
+  }
+}
+EOF
 cp "${REPO_DIR}/auto_mode_rules.json" "${DEST_DIR}/"
 cp "${REPO_DIR}/scripts/permission_classifier.py" "${DEST_DIR}/scripts/"
 chmod +x "${DEST_DIR}/scripts/permission_classifier.py"
@@ -130,6 +148,41 @@ if [ -t 0 ] && [ "${AUTO_CONFIRM}" = false ]; then
       echo "==> Skipping API key setup (classifier will run in local heuristic mode)."
     fi
   fi
+fi
+
+# Probe and cache active models if API key is present
+if [ -n "${API_KEY:-}" ]; then
+  echo "==> Probing available Gemini models for your API key..."
+  python3 -c "
+import urllib.request, json, os
+
+api_key = '${API_KEY}'
+url = 'https://generativelanguage.googleapis.com/v1beta/models'
+req = urllib.request.Request(url, headers={'x-goog-api-key': api_key})
+try:
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        data = json.loads(resp.read().decode('utf-8'))
+        available = {m['name'].replace('models/', '') for m in data.get('models', [])}
+        preferred = [
+            'gemini-2.5-flash',
+            'gemini-2.5-flash-lite',
+            'gemini-2.0-flash',
+            'gemini-1.5-flash',
+            'gemini-3.5-flash-lite',
+            'gemini-3.1-flash-lite',
+            'gemini-3.8-flash',
+            'gemma-2-27b-it',
+        ]
+        active = [m for m in preferred if m in available]
+        if active:
+            out_file = os.path.expanduser('~/.gemini/config/verified_classifier_models.json')
+            os.makedirs(os.path.dirname(out_file), exist_ok=True)
+            with open(out_file, 'w') as f:
+                json.dump({'models': active}, f, indent=2)
+            print('==> Verified active models on your account:', ', '.join(active[:4]))
+except Exception as e:
+    pass
+" || true
 fi
 
 # Verify hook execution
