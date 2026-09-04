@@ -13,7 +13,23 @@
 #
 set -euo pipefail
 
-TARGET_MODE="${1:---global}"
+TARGET_MODE="--global"
+AUTO_CONFIRM=false
+
+for arg in "$@"; do
+  case "${arg}" in
+    --workspace)
+      TARGET_MODE="--workspace"
+      ;;
+    --global)
+      TARGET_MODE="--global"
+      ;;
+    -y|--yes|--non-interactive|--agent)
+      AUTO_CONFIRM=true
+      ;;
+  esac
+done
+
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 echo "==> Antigravity Auto-Mode Installer"
@@ -83,7 +99,7 @@ with open(path, 'w') as f:
   echo "==> Saved GEMINI_API_KEY to ${ENV_FILE}"
 }
 
-if [ -t 0 ]; then
+if [ -t 0 ] && [ "${AUTO_CONFIRM}" = false ]; then
   echo ""
   echo "------------------------------------------------------------------"
   echo " Google AI Studio Key Setup (Free Tier: 500+ requests/day)"

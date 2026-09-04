@@ -63,7 +63,23 @@ flowchart TD
 
 ## Quickstart
 
-### 1. Installation
+### 🤖 1-Click Install for AI Agents (Claude Code, AGY, Cursor, Aider)
+
+Copy and paste this prompt directly into your AI assistant:
+
+> **"Please install and configure the Antigravity Auto-Mode Security Classifier on my system:**
+> 1. Clone or pull: `git clone https://github.com/marmarmamark/agy-auto-mode.git ~/.gemini/config/plugins/agy-auto-mode`
+> 2. Install: `bash ~/.gemini/config/plugins/agy-auto-mode/install.sh --global --yes`
+> 3. Test: `python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py`
+> 4. Check if `GEMINI_API_KEY` is in `~/.env` or environment; if missing, remind me to get a free key from https://aistudio.google.com/."**
+
+*(See [AGENT_PROMPT.md](AGENT_PROMPT.md) for full agent execution checklists).*
+
+---
+
+### Manual Installation
+
+#### 1. Installation
 
 Clone this repository directly into your global Antigravity plugins directory:
 
