@@ -23,6 +23,7 @@ Architecture:
 import json
 import os
 import re
+import shlex
 import sys
 import time
 import urllib.request
@@ -66,7 +67,7 @@ SENSITIVE_USER_PATH_REGEX = re.compile(
 
 # Sensitive file patterns (credentials, secrets, keys)
 SENSITIVE_FILE_PATTERNS = [
-    r"(?:^|[/\\])\.env(?:\.[a-zA-Z0-9_-]+)?$",
+    r"(?:^|[/\\])\.env(?:\.(?!example|sample|template|dist$)[a-zA-Z0-9_-]+)?$",
     r"(?:^|[/\\])id_[a-z0-9_]+(?:\.pub)?$",
     r"(?:^|[/\\]).*\.pem$",
     r"(?:^|[/\\]).*\.key$",
@@ -78,13 +79,13 @@ SENSITIVE_FILE_PATTERNS = [
 # is anchored for whole-path checks, so it cannot see `cat .env` (no leading separator,
 # trailing args after the name). This matches on shell token boundaries instead.
 SENSITIVE_FILE_TOKEN_RE = re.compile(
-    r"(?:^|[\s='\"`;|&])(?:\./)?(?:[\w.-]+/)*"
-    r"(?:\.env(?:\.[a-zA-Z0-9_-]+)?"
+    r"(?:^|[\s='\"`;|&])(?:\./)?(?:[\w.*?-]+/)*"
+    r"(?:[*?]?\.env(?:\.(?!example|sample|template|dist\b)[a-zA-Z0-9_-]+)?"
     r"|id_[a-z0-9_]+(?:\.pub)?"
-    r"|[\w.-]+\.(?:pem|key)"
+    r"|[\w.*?-]+\.(?:pem|key)"
     r"|credentials\.(?:json|ini)"
     r"|service[-_]account[\w.-]*\.json)"
-    r"(?:[\s='\"`;|&:]|$)"
+    r"(?:[\s='\"`;|&:*?]|$)"
 )
 
 # Cloud metadata endpoints: credential-bearing, never a legitimate agent target -> hard deny
@@ -203,8 +204,180 @@ SAFE_SEGMENT_PREFIXES = (
     "eslint ",
     "python3 -m venv ",
     "which ",
+    "command -v ",
     "echo ",
+    "cargo fmt",
+    "cargo clippy",
+    "cargo run",
+    "cargo doc",
+    "go run ",
+    "go vet ",
+    "go fmt ",
+    "gofmt ",
+    "npm ls",
+    "npm view ",
+    "npm outdated",
+    "pnpm run ",
+    "yarn run ",
+    "bun run ",
+    "jest ",
+    "vitest ",
+    "mocha ",
+    "prettier ",
+    "black ",
+    "isort ",
+    "mypy ",
+    "flake8 ",
 )
+
+# Leading noise that does not change what actually runs: environment assignments and
+# thin wrappers (`NODE_ENV=test npm test`, `timeout 30 pytest`). Stripped before
+# allow-list matching so a routine command is not pushed off the fast path by a prefix.
+LEADING_NOISE_RE = re.compile(
+    r"^(?:"
+    r"[A-Za-z_][A-Za-z0-9_]*=(?:\"[^\"]*\"|'[^']*'|[^\s;|&<>`]*)"
+    r"|env(?=\s+[A-Za-z_][A-Za-z0-9_]*=)"
+    r"|time|nice|stdbuf\s+-[^\s]+"
+    r"|timeout(?:\s+-[^\s]+)*\s+[0-9]+(?:\.[0-9]+)?[smhd]?"
+    r")\s+"
+)
+
+# An environment assignment usually says nothing about what runs, but these decide
+# WHICH binary or interpreter hook runs: `PATH=./evil npm test` is not `npm test`.
+ENV_HIJACK_RE = re.compile(
+    r"^(?:PATH|LD_[A-Z_]+|DYLD_[A-Z_]+|NODE_OPTIONS|PYTHON[A-Z]*|PERL5LIB|RUBYOPT"
+    r"|GEM_[A-Z_]+|BASH_ENV|ENV|IFS|SHELL|EDITOR|VISUAL|PAGER|GIT_[A-Z_]+)="
+)
+
+# Text-processing tools with an escape hatch to the shell: awk's system()/pipe-to-command
+# and GNU sed's `e` flag. Their program text is opaque data to the classifier, so a
+# segment carrying one of these constructs is not fast-pathed.
+TEXT_TOOL_EXEC_RE = re.compile(
+    r"system\s*\(|popen\s*\(|\|\s*[\"']?\s*(?:ba|z|k)?sh\b|/e[\"']?\s*$"
+)
+
+# Read-only utilities: they inspect the filesystem or transform text on stdout and never
+# mutate state. The sensitive-path and credential scans run before these, so they still
+# cannot be used to read ~/.ssh, /etc, or a .env file.
+READONLY_BINS = {
+    "ls", "pwd", "cat", "bat", "head", "tail", "wc", "file", "stat", "du", "df", "tree",
+    "basename", "dirname", "realpath", "readlink", "which", "type", "whoami", "hostname",
+    "uname", "date", "uptime", "id", "echo", "printf", "true", "false", "seq", "ps",
+    "grep", "egrep", "fgrep", "rg", "ag", "ack", "fd", "fdfind", "find", "awk", "gawk",
+    "jq", "yq", "sort", "uniq", "cut", "tr", "column", "diff", "comm", "nl", "cksum",
+    "md5sum", "sha1sum", "sha256sum", "shasum", "xxd", "od", "strings", "sed",
+}
+
+# `find` predicates that delete or execute. The full-line scan already soft-denies these,
+# but classify_segment must never report "safe" for them when called on its own.
+FIND_MUTATING_RE = re.compile(r"\s-(?:delete|exec|execdir|ok|okdir|fls|fprint[f0]?)\b")
+
+# In-place editing turns sed from a reader into a writer
+SED_IN_PLACE_RE = re.compile(r"(?:^|\s)(?:-[a-zA-Z]*i|--in-place)")
+
+# sed clauses that are unambiguously print/delete/substitute. GNU sed also has `e`
+# (run a shell command), `w` (write a file) and `r` (read one), and `sed -n '1e id'`
+# executes just as surely as `sh -c id` does - so anything outside these shapes is
+# escalated instead of fast-pathed.
+SED_SAFE_CLAUSE_RE = re.compile(
+    r"^(?:"
+    r"[0-9,$~+ ]*(?:/(?:\\.|[^/])*/)?\s*[pdq=]?"
+    r"|s([/|#,:!])(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gimIMp0-9]*"
+    r"|y([/|#,:!])(?:\\.|(?!\2).)*\2(?:\\.|(?!\2).)*\2"
+    r")$"
+)
+
+def split_sed_args(args):
+    """
+    Separate a sed invocation into (scripts, file operands, readable).
+
+    `readable` is False when the script comes from a -f file the classifier cannot see.
+    Splitting matters for the operand check: `/foo/d` is a script, not an absolute path,
+    and must not be mistaken for a write outside the workspace.
+    """
+    scripts = []
+    operands = []
+    expect_script = False
+    for arg in args:
+        if expect_script:
+            scripts.append(arg)
+            expect_script = False
+            continue
+        if arg in ("-e", "--expression"):
+            expect_script = True
+            continue
+        if arg in ("-f", "--file") or arg.startswith("-f") or arg.startswith("--file="):
+            return ([], [], False)
+        if arg.startswith("-"):
+            continue
+        operands.append(arg)
+    if not scripts and operands:
+        scripts = [operands.pop(0)]
+    return (scripts, operands, True)
+
+def sed_scripts_are_safe(scripts):
+    """True when every sed clause is a plain print, delete, substitute or transliterate."""
+    if not scripts:
+        return False
+    for script in scripts:
+        for clause in re.split(r"[;\n]", script):
+            if not SED_SAFE_CLAUSE_RE.match(clause.strip()):
+                return False
+    return True
+
+# Commands that write, but only inside the workspace: every path operand must be
+# workspace-relative (no leading /, ~ or $, no .. traversal) - the same boundary the
+# file-edit tools enforce.
+LOCAL_WRITE_BINS = {"mkdir", "touch", "cp", "mv", "tee"}
+
+# Interpreters that run a script file. Inline-code and module flags are excluded:
+# `python -c` is arbitrary code with no path left to check.
+SCRIPT_RUNNER_BINS = {"node", "python", "python3", "ruby", "deno", "bun"}
+INLINE_CODE_FLAGS = ("-c", "-e", "-m", "-p", "-i", "--eval", "--exec", "--print")
+
+# Restoring already-declared dependencies from a committed manifest or lockfile. This
+# executes the same package code `npm run` and `pytest` already execute. It is NOT
+# `install <new package>`, which pulls unreviewed code and stays on the slow path.
+DEPENDENCY_RESTORE_RE = re.compile(
+    r"^(?:npm\s+(?:ci|install|i)"
+    r"|(?:pnpm|yarn|bun)(?:\s+(?:install|i))?"
+    r"|(?:pip|pip3)\s+install\s+-r\s+[^\s]+"
+    r"|poetry\s+install|bundle\s+install|uv\s+sync"
+    r"|go\s+mod\s+(?:download|tidy)|cargo\s+fetch)"
+    r"(?:\s+-[^\s]+)*\s*$"
+)
+GLOBAL_INSTALL_RE = re.compile(r"(?:^|\s)(?:-g|--global|--location=global)\b")
+
+# Read-only git subcommands: they query history, refs or config and never touch the
+# working tree, the index, or a remote.
+GIT_READONLY_SUBCOMMANDS = {
+    "status", "diff", "log", "show", "branch", "tag", "blame", "shortlog", "describe",
+    "reflog", "rev-parse", "rev-list", "ls-files", "ls-tree", "ls-remote", "cat-file",
+    "show-ref", "for-each-ref", "symbolic-ref", "merge-base", "name-rev", "whatchanged",
+    "count-objects", "grep", "diff-tree", "diff-index", "diff-files", "check-ignore",
+    "verify-commit", "version", "help",
+}
+
+# Git subcommands that write, but only in recoverable ways: the index, a new commit,
+# a new branch, the stash, or the object store.
+GIT_SAFE_WRITE_SUBCOMMANDS = {"add", "commit", "checkout", "switch", "stash", "fetch", "init"}
+
+# Further git forms that silently discard work, in the same class as `git reset --hard`
+GIT_DESTRUCTIVE_SUBCOMMAND_PATTERNS = [
+    (r"^git\s+restore\b(?!.*\s--staged\b)", "git restore overwrites the working tree"),
+    (r"^git\s+restore\b.*\s--worktree\b", "git restore --worktree overwrites the working tree"),
+    (r"^git\s+stash\s+(?:drop|clear)\b", "git stash drop/clear discards stashed work"),
+]
+
+# Read-only container queries
+DOCKER_READONLY_SUBCOMMANDS = {"ps", "images", "logs", "inspect", "version", "info",
+                               "stats", "top", "port", "history"}
+
+# Redirections. A descriptor duplication (`2>&1`) moves nothing to disk and /dev/null
+# discards; any other target is a file write and must stay workspace-relative.
+FD_DUP_RE = re.compile(r"(?:^|\s)&?\d?>&(?:\d|-)")
+REDIRECT_RE = re.compile(r"(?:^|\s)(?:&|\d)?(?:>>|>|<)\s*(?P<target>[^\s;|&<>]+)")
+DISCARD_TARGETS = {"/dev/null", "/dev/stdout", "/dev/stderr"}
 
 # `source`/`.` execute arbitrary shell in the current process, so the bare verb is never
 # safe. Only virtualenv activation is allow-listed, matched against the whole segment.
@@ -237,6 +410,27 @@ LOCAL_BIN_RES = (
     re.compile(r"^(?:\./)?(?:\.venv|venv|env)/bin/(.+)$"),
     re.compile(r"^(?:\./)?node_modules/\.bin/(.+)$"),
 )
+
+# Read-only inspection tools. Every one is still gated by the sensitive-path and
+# workspace-boundary checks; listing them here only keeps a routine file read from
+# failing closed just because the host names the tool differently.
+READ_ONLY_TOOLS = {
+    "view_file",
+    "list_dir",
+    "grep_search",
+    "read_resource",
+    "list_resources",
+    "codebase_search",
+    "find_by_name",
+    "view_code_item",
+    "view_content_chunk",
+    "view_line_range",
+    "view_file_outline",
+    "search_in_file",
+    "glob_file_search",
+    "read_file",
+    "list_directory",
+}
 
 # Known file edit tools
 FILE_EDIT_TOOLS = {
@@ -339,15 +533,198 @@ def is_private_network_target(text):
     return False
 
 def split_command_segments(cmd_line):
-    """Split compound command string on shell operators: ; && || | & \n."""
+    """
+    Split compound command string on shell operators: ; && || | & \n.
+
+    A `&` belonging to a descriptor redirection (`2>&1`, `cmd &> log`) is not an
+    operator; splitting there produced the nonsense segments `npm test 2>` and `1`,
+    which then failed closed and prompted for an everyday test run.
+    """
     if not cmd_line:
         return []
-    parts = re.split(r"(?:&&|\|\||[;&|\n])", cmd_line)
+    parts = re.split(r"(?:&&|\|\||[;|\n]|(?<!>)&(?!>))", cmd_line)
     return [p.strip() for p in parts if p and p.strip()]
 
-def contains_dynamic_substitutions(cmd_line):
-    """Detect dynamic command substitutions: $(...), `...`, <(...), >(...)."""
-    return any(sub in cmd_line for sub in ("$(", "`", "<(", ">("))
+def mask_substitutions(cmd_line):
+    """
+    Replace $(...), `...`, <(...) and >(...) bodies with a placeholder, returning
+    (masked_line, bodies).
+
+    The bodies are classified in their own right, so `cd "$(git rev-parse --show-toplevel)"`
+    stays on the fast path instead of being disqualified by the mere presence of a
+    substitution. Returns (line, None) when a substitution is unbalanced; the caller
+    treats that as unknown.
+    """
+    bodies = []
+    out = []
+    i = 0
+    n = len(cmd_line)
+    while i < n:
+        ch = cmd_line[i]
+        if ch == "`":
+            close = cmd_line.find("`", i + 1)
+            if close == -1:
+                return (cmd_line, None)
+            bodies.append(cmd_line[i + 1:close])
+            out.append("SUBST")
+            i = close + 1
+            continue
+        opens_paren = i + 1 < n and cmd_line[i + 1] == "("
+        if opens_paren and (ch == "$" or ch in "<>"):
+            depth = 1
+            j = i + 2
+            while j < n and depth:
+                if cmd_line[j] == "(":
+                    depth += 1
+                elif cmd_line[j] == ")":
+                    depth -= 1
+                j += 1
+            if depth:
+                return (cmd_line, None)
+            bodies.append(cmd_line[i + 2:j - 1])
+            out.append("SUBST")
+            i = j
+            continue
+        out.append(ch)
+        i += 1
+    return ("".join(out), bodies)
+
+def tokenize(seg):
+    """Shell-aware token split, falling back to whitespace on unbalanced quotes."""
+    try:
+        return shlex.split(seg, posix=True)
+    except ValueError:
+        return seg.split()
+
+def strip_leading_noise(seg):
+    """Remove env assignments and thin wrappers that do not change what runs."""
+    prev = None
+    while prev != seg:
+        prev = seg
+        seg = LEADING_NOISE_RE.sub("", seg, count=1).lstrip()
+    return seg
+
+def paths_are_workspace_relative(tokens):
+    """Every non-flag operand must stay inside the workspace tree."""
+    for tok in tokens:
+        if not tok or tok.startswith("-"):
+            continue
+        if tok[0] in "/~$":
+            return False
+        if ".." in tok.split("/"):
+            return False
+    return True
+
+def split_redirections(seg):
+    """
+    Strip redirections, returning (command_part, verdict).
+
+    `2>&1` moves nothing to disk and /dev/null discards, so neither disqualifies an
+    otherwise benign command. Any other redirect writes a file and is only fast-pathed
+    when the target is workspace-relative and not sensitive.
+    """
+    work = FD_DUP_RE.sub(" ", seg)
+    verdict = "safe"
+    for match in REDIRECT_RE.finditer(work):
+        target = match.group("target")
+        if target in DISCARD_TARGETS:
+            continue
+        if not paths_are_workspace_relative([target]) or contains_sensitive_reference(target):
+            verdict = "unknown"
+    return (REDIRECT_RE.sub(" ", work).strip(), verdict)
+
+def classify_git_segment(args):
+    """
+    Verdict for a git segment whose dangerous forms have already been rejected.
+    Returns None when the subcommand is unrecognized, leaving it to Tier 2.
+    """
+    while args and args[0].startswith("-"):
+        args = args[1:]
+    if not args:
+        return ("safe", "")
+
+    sub = args[0]
+    rest = args[1:]
+
+    if sub in GIT_READONLY_SUBCOMMANDS or sub in GIT_SAFE_WRITE_SUBCOMMANDS:
+        return ("safe", "")
+    if sub == "remote":
+        operands = [a for a in rest if not a.startswith("-")]
+        if not operands or operands[0] in ("show", "get-url"):
+            return ("safe", "")
+        return ("unknown", "git remote rewrites repository configuration")
+    if sub == "config":
+        if any(a.startswith("--get") or a in ("--list", "-l") for a in rest):
+            return ("safe", "")
+        return ("unknown", "git config writes configuration")
+    if sub == "restore":
+        # The destructive forms are rejected before this point; only unstaging is left.
+        return ("safe", "")
+    if sub in ("worktree", "submodule", "stash") and rest and rest[0] in ("list", "status"):
+        return ("safe", "")
+    return None
+
+def classify_known_binary(seg):
+    """
+    Verdict derived from the segment's binary. Returns None when the binary is not
+    recognized, so the caller can escalate rather than guess.
+    """
+    tokens = tokenize(seg)
+    if not tokens:
+        return None
+    binary = os.path.basename(tokens[0])
+    args = tokens[1:]
+
+    if binary == "git":
+        return classify_git_segment(args)
+
+    if binary in ("cd", "pushd", "popd"):
+        return ("safe", "")
+
+    if binary == "docker":
+        if args and args[0] in DOCKER_READONLY_SUBCOMMANDS:
+            return ("safe", "")
+        if len(args) > 1 and args[0] == "compose" and args[1] in ("ps", "logs", "config"):
+            return ("safe", "")
+        return None
+
+    if binary == "find":
+        if FIND_MUTATING_RE.search(" " + seg):
+            return ("dangerous", "find predicate deletes files or executes commands")
+        return ("safe", "")
+
+    if binary in ("awk", "gawk", "mawk", "sed") and TEXT_TOOL_EXEC_RE.search(seg):
+        return ("unknown", "text-tool program can invoke a shell")
+
+    if binary == "sed":
+        scripts, operands, readable = split_sed_args(args)
+        if not readable or not sed_scripts_are_safe(scripts):
+            return ("unknown", "sed script is not a plain print/substitute")
+        if SED_IN_PLACE_RE.search(" " + " ".join(args)):
+            if paths_are_workspace_relative(operands):
+                return ("safe", "")
+            return ("unknown", "in-place edit outside the workspace")
+        return ("safe", "")
+
+    if binary in READONLY_BINS:
+        return ("safe", "")
+
+    if binary in LOCAL_WRITE_BINS:
+        if paths_are_workspace_relative(args):
+            return ("safe", "")
+        return ("unknown", "writes outside the workspace")
+
+    if binary in SCRIPT_RUNNER_BINS:
+        if any(a in INLINE_CODE_FLAGS for a in args):
+            return ("unknown", "runs inline code rather than a workspace script")
+        if paths_are_workspace_relative(args):
+            return ("safe", "")
+        return ("unknown", "runs a script outside the workspace")
+
+    if DEPENDENCY_RESTORE_RE.match(seg) and not GLOBAL_INSTALL_RE.search(seg):
+        return ("safe", "")
+
+    return None
 
 def classify_segment(seg):
     """
@@ -363,11 +740,12 @@ def classify_segment(seg):
     finding decay into an LLM "allow".
     """
     seg_clean = seg.strip()
+    if ENV_HIJACK_RE.match(seg_clean):
+        return ("unknown", "environment assignment can redirect which binary runs")
+
+    seg_clean = strip_leading_noise(seg_clean)
     if not seg_clean:
         return ("safe", "")
-
-    # Any redirection can write files, so it disqualifies an otherwise benign verb
-    has_redirect = ">" in seg_clean
 
     if seg_clean == "git" or seg_clean.startswith("git "):
         for flag in GIT_DANGEROUS_FLAGS:
@@ -379,10 +757,18 @@ def classify_segment(seg):
             for pattern, desc in DESTRUCTIVE_CHECKOUT_PATTERNS:
                 if re.search(pattern, seg_clean):
                     return ("dangerous", f"discards uncommitted work: {desc}")
+        for pattern, desc in GIT_DESTRUCTIVE_SUBCOMMAND_PATTERNS:
+            if re.search(pattern, seg_clean):
+                return ("dangerous", desc)
         # `submodule foreach` runs a command outright; `update` fetches remote content
         # and checks it out, which can trigger hooks
         if re.match(r"^git\s+submodule\s+(?:update|foreach)\b", seg_clean):
             return ("dangerous", "git submodule update/foreach fetches remote content and can execute hooks")
+
+    # Defense in depth: classify() already soft-denies a sensitive reference on the full
+    # command line, but a segment reached through a substitution body must be gated too.
+    if contains_sensitive_reference(seg_clean):
+        return ("unknown", "references a sensitive path or credential file")
 
     # `source` / `.` run arbitrary shell in the current process; only venv activation is safe
     if re.match(r"^(?:source|\.)\s", seg_clean):
@@ -395,34 +781,33 @@ def classify_segment(seg):
     # (wget is excluded because it saves to disk by default.) Pipes to a shell and
     # credential exfiltration are already caught on the full command line above.
     if re.match(r"^curl\b", seg_clean):
-        if (not has_redirect
+        if (">" not in seg_clean
                 and is_private_network_target(seg_clean)
                 and not CURL_WRITE_OR_UPLOAD_RE.search(seg_clean)):
             return ("safe", "")
         return ("unknown", "")
 
+    cmd_part, redirect_verdict = split_redirections(seg_clean)
+    if redirect_verdict != "safe":
+        return ("unknown", "redirects output outside the workspace")
+
     # Normalize virtualenv / node local-bin launchers to the underlying command name
-    candidate_segs = [seg_clean]
+    candidate_segs = [cmd_part]
     for local_bin_re in LOCAL_BIN_RES:
-        m_bin = local_bin_re.match(seg_clean)
+        m_bin = local_bin_re.match(cmd_part)
         if m_bin:
             candidate_segs.append(m_bin.group(1).strip())
             break
 
-    if not has_redirect:
-        for c_seg in candidate_segs:
-            if c_seg in SAFE_SEGMENT_EXACT:
+    for c_seg in candidate_segs:
+        if c_seg in SAFE_SEGMENT_EXACT:
+            return ("safe", "")
+        for prefix in SAFE_SEGMENT_PREFIXES:
+            if c_seg.startswith(prefix):
                 return ("safe", "")
-            for prefix in SAFE_SEGMENT_PREFIXES:
-                if c_seg.startswith(prefix):
-                    return ("safe", "")
-
-        # File reading utilities are safe only when they touch nothing sensitive
-        for read_bin in ("cat ", "head ", "tail ", "ls ", "grep "):
-            if seg_clean.startswith(read_bin):
-                if not contains_sensitive_reference(seg_clean):
-                    return ("safe", "")
-                return ("unknown", "reads a sensitive path")
+        verdict = classify_known_binary(c_seg)
+        if verdict:
+            return verdict
 
     return ("unknown", "")
 
@@ -726,17 +1111,40 @@ def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
 # Main Classification Entrypoint
 # ---------------------------------------------------------------------------
 
+def resolve_workspaces(payload):
+    """
+    Trusted workspace roots. Falls back to the host-provided working directory when no
+    explicit workspace list is sent, so a host that omits workspacePaths does not turn
+    every workspace edit into a prompt. The filesystem root and the bare home directory
+    are rejected: neither is a boundary.
+    """
+    workspaces = [w for w in (payload.get("workspacePaths") or []) if w]
+    if workspaces:
+        return workspaces
+
+    cwd = payload.get("cwd") or payload.get("workingDirectory") or payload.get("WorkingDirectory")
+    if cwd:
+        try:
+            real = os.path.realpath(os.path.expanduser(str(cwd).strip()))
+        except Exception:
+            return []
+        home = os.path.realpath(os.path.expanduser("~"))
+        if real.startswith(os.sep) and real not in (os.sep, home):
+            return [real]
+
+    return []
+
 def classify(payload):
     tool_call = payload.get("toolCall") or {}
     tool_name = tool_call.get("name") or ""
     tool_args = tool_call.get("args") or {}
-    workspaces = payload.get("workspacePaths") or []
+    workspaces = resolve_workspaces(payload)
     transcript_path = payload.get("transcriptPath") or ""
 
     # -----------------------------------------------------------------------
     # 1. Inspection & Read Tools: Gated by Sensitive Path & Boundary Checks
     # -----------------------------------------------------------------------
-    if tool_name in ("view_file", "list_dir", "grep_search", "read_resource", "list_resources"):
+    if tool_name in READ_ONLY_TOOLS:
         target_path = None
         for k in FILE_PATH_KEYS:
             if k in tool_args and tool_args[k]:
@@ -828,9 +1236,15 @@ def classify(payload):
         if contains_sensitive_reference(cmd_line):
             return {"decision": "force_ask", "reason": f"Soft Deny: Command references sensitive path in '{cmd_line[:50]}'"}
 
-        # Decompose compound commands (; && || | & \n) and classify each segment
-        segments = split_command_segments(cmd_line)
+        # Decompose compound commands (; && || | & \n) and classify each segment.
+        # Substitution bodies are masked out first so they cannot corrupt the split, then
+        # classified in their own right: a command is only as safe as what runs inside
+        # its substitutions.
+        masked_line, sub_bodies = mask_substitutions(cmd_line)
+        segments = split_command_segments(masked_line)
         verdicts = [classify_segment(seg) for seg in segments]
+        for body in (sub_bodies or []):
+            verdicts.extend(classify_segment(seg) for seg in split_command_segments(body))
 
         # An affirmatively dangerous segment always prompts and never reaches Tier 2.
         # Checked even when substitutions are present, so `git checkout -- . && $(x)`
@@ -839,7 +1253,8 @@ def classify(payload):
             if verdict == "dangerous":
                 return {"decision": "force_ask", "reason": f"Soft Deny: {reason} in '{cmd_line[:50]}'"}
 
-        if (segments and not contains_dynamic_substitutions(cmd_line)
+        # sub_bodies is None only when a substitution is unbalanced, which stays unknown.
+        if (segments and sub_bodies is not None
                 and all(verdict == "safe" for verdict, _ in verdicts)):
             return {"decision": "allow", "reason": "Fast-Path: All command segments verified safe"}
 

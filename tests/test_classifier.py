@@ -549,6 +549,123 @@ class TestPermissionClassifierSecurity(HermeticTestCase):
                     "./node_modules/.bin/eslint src/"]:
             self.assertEqual(self.decide(cmd), "allow", f"local bin launcher blocked: {cmd}")
 
+    # -----------------------------------------------------------------------
+    # 14. Everyday Development Work Runs Without a Prompt
+    # -----------------------------------------------------------------------
+
+    def test_routine_inspection_is_fast_path_allowed(self):
+        for cmd in ["ls", "ls -la src", "cat package.json", "head -50 README.md",
+                    "wc -l scripts/x.py", "tree -L 2", "stat README.md", "du -sh .",
+                    "find . -name '*.py'", "rg 'def classify' scripts/", "jq '.scripts' pkg.json",
+                    "sed -n '1,40p' scripts/x.py", "awk '{print $1}' data.txt",
+                    "sort f.txt | uniq -c | head -20", "diff a.txt b.txt", "which python3",
+                    "command -v node", "date", "shasum -a 256 dist/app.js", "cd src"]:
+            self.assertEqual(self.decide(cmd), "allow", f"routine inspection prompted: {cmd}")
+
+    def test_read_only_git_queries_are_fast_path_allowed(self):
+        for cmd in ["git rev-parse --show-toplevel", "git ls-files", "git blame README.md",
+                    "git describe --tags", "git reflog", "git remote -v", "git remote show origin",
+                    "git config --get user.email", "git merge-base main HEAD", "git shortlog -sn",
+                    "git fetch origin", "git worktree list", "git submodule status",
+                    "git grep -n TODO", "git --no-pager log -3", "git restore --staged src/a.ts"]:
+            self.assertEqual(self.decide(cmd), "allow", f"read-only git query prompted: {cmd}")
+
+    def test_build_and_test_invocations_are_fast_path_allowed(self):
+        for cmd in ["npm ci", "npm install", "pnpm install", "yarn", "pip install -r requirements.txt",
+                    "go mod download", "uv sync", "cargo clippy --all-targets", "cargo fmt",
+                    "go vet ./...", "prettier --check .", "mypy src", "jest --silent",
+                    "node scripts/build.js", "python3 tools/gen.py --out dist",
+                    "NODE_ENV=test npm test", "timeout 60 npm test", "time cargo build"]:
+            self.assertEqual(self.decide(cmd), "allow", f"build/test invocation prompted: {cmd}")
+
+    def test_descriptor_duplication_is_not_a_command_separator(self):
+        """`2>&1` was split on `&`, leaving the nonsense segments `npm test 2>` and `1`."""
+        for cmd in ["npm test 2>&1 | tail -20", "pytest -q > /dev/null 2>&1",
+                    "npm run build 2>&1", "cargo test 2>&1 | grep -c FAILED"]:
+            self.assertEqual(self.decide(cmd), "allow", f"redirected run prompted: {cmd}")
+
+    def test_workspace_relative_writes_are_allowed(self):
+        for cmd in ["mkdir -p src/components", "touch src/new.ts", "cp src/a.ts src/b.ts",
+                    "mv src/old.ts src/new.ts", "sed -i.bak 's/foo/bar/g' src/a.ts",
+                    "echo 'hello' > notes.txt", "ls -la >> out.log"]:
+            self.assertEqual(self.decide(cmd), "allow", f"workspace write prompted: {cmd}")
+
+    def test_writes_outside_the_workspace_are_not_fast_pathed(self):
+        for cmd in ["cp src/secret.ts ~/exfil.ts", "mv src /tmp/stash", "mkdir -p ../../outside/dir",
+                    "touch /tmp/marker", "sed -i 's/a/b/' ../outside/file",
+                    "echo pwned > ../outside.txt", "node ../outside/evil.js",
+                    "python3 /tmp/evil.py"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"write escaped the workspace: {cmd}")
+
+    # -----------------------------------------------------------------------
+    # 15. The Broadened Fast Path Cannot Be Used As A Bypass
+    # -----------------------------------------------------------------------
+
+    def test_execution_redirecting_env_assignments_are_not_stripped_as_noise(self):
+        """`NODE_ENV=test npm test` is `npm test`; `PATH=./evil npm test` is not."""
+        for cmd in ["PATH=./evil npm test", "LD_PRELOAD=./evil.so pytest",
+                    "DYLD_INSERT_LIBRARIES=./x.dylib npm test",
+                    "NODE_OPTIONS='--require ./evil.js' npm test",
+                    "PYTHONPATH=./evil python3 -m pytest", "BASH_ENV=./evil.sh make build",
+                    "GIT_SSH_COMMAND='sh -c id' git fetch", "GIT_EXTERNAL_DIFF=./evil git diff",
+                    "IFS=';' git status"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"env hijack fast-pathed: {cmd}")
+
+    def test_text_tools_cannot_shell_out_on_the_fast_path(self):
+        for cmd in ["awk 'BEGIN{system(\"id\")}'", "awk '{print | \"sh\"}' file",
+                    "sed -n '1e id' file", "sed -f script.sed file",
+                    "sed 's/a/b/w /workspace/out' f"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"text tool shell escape allowed: {cmd}")
+
+    def test_inline_interpreter_code_is_not_fast_pathed(self):
+        for cmd in ["python3 -c 'import os;os.system(\"id\")'", "node -e 'x'", "node --eval 'x'"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"inline code allowed: {cmd}")
+
+    def test_substitution_bodies_are_classified_on_their_own(self):
+        """A substitution no longer blocks the fast path, so its body must be judged."""
+        self.assertEqual(self.decide("cd $(git rev-parse --show-toplevel) && git status"), "allow")
+        self.assertEqual(self.decide("echo $(date)"), "allow")
+        for cmd in ["echo $(git checkout -- .)", "cd $(cat ~/.ssh/id_rsa)", "ls `sudo whoami`",
+                    "git commit -m \"$(rm -rf build)\"", "echo `unbalanced"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"substitution laundered: {cmd}")
+
+    def test_further_destructive_git_forms_require_confirmation(self):
+        for cmd in ["git restore .", "git restore --staged --worktree src/", "git stash drop",
+                    "git stash clear", "git config user.email evil@example.com",
+                    "git remote add evil https://evil.com/r.git",
+                    "git remote set-url origin https://evil.com/r.git", "git worktree add /tmp/wt"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"destructive git form allowed: {cmd}")
+
+    def test_dependency_restore_is_allowed_but_new_packages_are_not(self):
+        for cmd in ["npm ci", "npm install", "poetry install", "bundle install"]:
+            self.assertEqual(self.decide(cmd), "allow", f"lockfile restore prompted: {cmd}")
+        for cmd in ["npm install left-pad", "pip install requests", "npm install -g pkg",
+                    "npm ci --global"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"new package install allowed: {cmd}")
+
+    def test_credential_globs_are_caught_and_templates_are_not(self):
+        for cmd in ["cat *.pem", "cat keys/*.key", "grep -r . *.env", "cat .env*"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"credential glob allowed: {cmd}")
+        for cmd in ["cat .env.example", "cat .env.sample", "cat .env.template"]:
+            self.assertEqual(self.decide(cmd), "allow", f"env template prompted: {cmd}")
+
+    def test_redirects_to_a_sensitive_or_external_target_still_prompt(self):
+        for cmd in ["cat src/a.ts > /etc/motd", "cat src/a.ts > ~/copy.ts",
+                    "curl http://localhost:3000/ > out.txt", "tee ~/.ssh/authorized_keys"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"redirect escaped: {cmd}")
+
+    # -----------------------------------------------------------------------
+    # 16. Workspace Resolution
+    # -----------------------------------------------------------------------
+
+    def test_host_cwd_is_used_when_no_workspace_list_is_sent(self):
+        edit = {"name": "write_to_file", "args": {"TargetFile": os.path.join(self.workspace, "a.ts")}}
+        self.assertEqual(pc.classify({"toolCall": edit, "cwd": self.workspace})["decision"], "allow")
+        # Neither the filesystem root nor the bare home directory is a boundary
+        self.assertEqual(pc.classify({"toolCall": edit, "cwd": "/"})["decision"], "force_ask")
+        self.assertEqual(pc.classify({"toolCall": edit, "cwd": "~"})["decision"], "force_ask")
+        self.assertEqual(pc.classify({"toolCall": edit})["decision"], "force_ask")
+
 
 class _FakeResponse(object):
     """Minimal stand-in for the urlopen context manager."""

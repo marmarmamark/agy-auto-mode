@@ -17,13 +17,15 @@ Stop dealing with repetitive, disruptive confirmation prompts for routine comman
 `agy-auto-mode` is designed to **prevent an aligned AI coding agent from executing catastrophic or dangerous actions by accident or misunderstanding** (such as recursive directory wipes, privilege escalation, force-pushing over remote history, or transmitting private credentials).
 
 > [!NOTE]
-> Developer tooling commands like `npm run <script>`, `pytest`, `cargo test`, `go test`, and `make` execute developer-defined code by construction (via `package.json`, `conftest.py`, `build.rs`, or `Makefile`). Auto-mode acts as an intelligent operational safety guardrail, not an operating system-level sandbox against a hostile repository or a compromised model.
+> Developer tooling commands like `npm run <script>`, `pytest`, `cargo test`, `go test`, and `make` execute developer-defined code by construction (via `package.json`, `conftest.py`, `build.rs`, or `Makefile`). Restoring already-declared dependencies (`npm ci`, `pip install -r`) runs that same code. Auto-mode acts as an intelligent operational safety guardrail, not an operating system-level sandbox against a hostile repository or a compromised model.
 
 ---
 
 ## Key Features
 
-- **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API.
+- **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API. The deterministic allow-list covers everyday development end to end — read-only utilities (`ls`, `cat`, `rg`, `jq`, `sed -n`, `find`, `awk`), read-only git (`rev-parse`, `ls-files`, `blame`, `remote -v`, `config --get`, `fetch`), build and test runners, lockfile dependency restores, pipes, `2>&1` redirection, env-prefixed and `timeout`-wrapped commands, and workspace-relative writes (`mkdir`, `touch`, `cp`, `mv`, `sed -i`, `> file`).
+- **🎯 Prompts Only Where It Matters:** Because Tier 1 recognizes the routine work, confirmation is reserved for what actually carries risk. Against a 121-command corpus of everyday development commands the fast path allows 100% with no AI call; against a 55-command corpus of destructive, exfiltrating and bypass-shaped commands it allows none.
+- **🔎 Substitution-Aware:** `$(...)`, backticks and `<(...)` no longer disqualify a command wholesale — the body is extracted and classified in its own right, so `cd $(git rev-parse --show-toplevel)` runs while `echo $(git checkout -- .)` still prompts.
 - **🛡️ Compound Command Decomposition:** Chained commands (`;`, `&&`, `||`, `|`, `\n`) are split and analyzed so every single sub-command must be on the strict allow-list.
 - **🔒 Fail-Closed By Default:** Missing schemas, unknown tools, and ambiguous offline commands default to user confirmation (`force_ask`), never silent execution.
 - **⛔ Deterministic Findings Are Final:** A construct the local rules flag as dangerous always prompts. It is never handed to the AI tier, which cannot upgrade it to `allow`.
@@ -44,6 +46,8 @@ flowchart TD
     FastPath -->|Dangerous Pattern e.g. sudo, git reset --hard| Ask[SOFT DENY: User Confirmation]
     FastPath -->|Sensitive Boundary e.g. ~/.ssh, /etc| Ask
     FastPath -->|Unrecognized Tool e.g. deploy_to_production| Ask
+    FastPath -->|Write or redirect outside the workspace| Ask
+    FastPath -->|Execution-redirecting env assignment e.g. PATH=, LD_PRELOAD=| Ask
     FastPath -->|All segments verified safe e.g. git status && git diff| Allow[Instant ALLOW <2ms]
     
     FastPath --> Segments{Per-segment verdict}
@@ -135,7 +139,7 @@ Get a free Google AI Studio key at [aistudio.google.com](https://aistudio.google
 
 #### 3. Verify Installation
 
-Run the test suite (38 tests, hermetic — no network, no API key required):
+Run the test suite (55 tests, hermetic — no network, no API key required):
 
 ```bash
 python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py
@@ -151,21 +155,28 @@ The policy rules are defined in `auto_mode_rules.json`. You can customize them g
 {
   "allow": [
     "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
-    "Code modifications to files located strictly within trusted workspaces",
+    "Read-only shell utilities: ls, cat, head, tail, wc, stat, du, df, tree, find, grep, rg, sed -n, awk, jq, sort, uniq, cut, diff, which, date",
+    "Code modifications to files located strictly within trusted workspaces, including workspace-relative mkdir, touch, cp, mv, sed -i and output redirection",
     "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc, make",
-    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, and branch-shaped checkout/switch",
+    "Restoring already-declared dependencies from a committed manifest or lockfile: npm ci, npm install, pip install -r, poetry install, go mod download",
+    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, fetch, rev-parse, ls-files, blame, remote -v, config --get, and branch-shaped checkout/switch",
+    "Redirecting output to /dev/null or a workspace-relative file, and descriptor duplication such as 2>&1",
     "Reading a local development server over loopback or a private subnet (plain curl fetches, no upload or file output)"
   ],
   "soft_deny": [
     "File deletions or recursive directory removals (rm, rm -rf, shred)",
     "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
-    "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f",
+    "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f, git restore, git stash drop/clear",
     "Checkout forms that discard uncommitted work: git checkout -- <path>, git checkout ., -f/--force, --discard-changes, --ours, --theirs",
     "Git flags that execute commands or write arbitrary files: --upload-pack, --receive-pack, --exec, --output, --ext-diff, and -c/--config overrides",
     "git submodule update/foreach: fetches remote content and can execute hooks",
+    "Git commands that rewrite repository configuration or remotes: git config <set>, git remote add/set-url",
+    "Environment assignments that redirect which binary or interpreter hook runs: PATH, LD_PRELOAD, DYLD_*, NODE_OPTIONS, PYTHONPATH, BASH_ENV, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, IFS",
+    "Installing new packages that are not already declared in the project manifest, and any global install (-g, --global)",
+    "Inline interpreter code (python -c, node -e) and text-tool programs that shell out (awk system(), sed e/w/f)",
     "Sourcing arbitrary shell scripts (source/. anything other than a virtualenv activate script)",
     "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
-    "Modifications targeting sensitive system paths or files outside workspace roots"
+    "Modifications, redirections or copies targeting sensitive system paths or any path outside workspace roots"
   ],
   "hard_deny": [
     "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
