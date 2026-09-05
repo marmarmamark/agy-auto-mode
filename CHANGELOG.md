@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `git pull` and `git merge` on the fast path, alongside the existing `git fetch`.
 
 ### Fixed
+- Installer model probe verifies reachability by making one minimal `generateContent` call per candidate, instead of trusting the `supportedGenerationMethods` field in the model listing. `gemini-2.5-flash` and `gemini-2.5-flash-lite` advertise that method and still return HTTP 404 when called, so the previous probe cached two dead models at the head of the pool. The runtime demoted them on first use, but every re-run of `install.sh` put them back, costing two wasted round-trips on the next ambiguous command.
 - **Security: the `/tmp` exemption was a textual lookahead, so `rm -rf /tmp/../etc` read as a `/tmp` path and was allowed outright.** Operands are now resolved with `realpath` before they are judged.
 - **Security: the recursive-deletion pattern never matched the form people actually type.** `\brm\s+-[a-zA-Z]*r\b` required the flag cluster to end in `r`, so `rm -fr x` matched and `rm -rf x` did not, and the companion `rm -...f` rule had been deleted. `rm` is now owned entirely by the segment classifier, which resolves paths instead of pattern-matching them.
 - Command segmentation is quote-aware. A `;` or `|` inside a quoted string was treated as a separator, shredding `python3 -c 'import json; print(x)'` into nonsense segments that then failed closed. An unterminated quote falls back to the previous naive split, which over-segments and so can only prompt more, never less.

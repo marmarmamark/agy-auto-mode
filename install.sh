@@ -197,7 +197,7 @@ fi
 if [ -n "${API_KEY:-}" ]; then
   echo "==> Probing available Gemini models for your API key..."
   PROBE_KEY="${API_KEY}" python3 -c '
-import urllib.request, json, os, sys
+import urllib.request, urllib.error, json, os, sys
 
 api_key = os.environ.get("PROBE_KEY", "").strip()
 if not api_key:
@@ -207,10 +207,13 @@ req = urllib.request.Request(url, headers={"x-goog-api-key": api_key})
 try:
     with urllib.request.urlopen(req, timeout=5) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        # A model can be listed and still 404 on generateContent (wrong method, or not
-        # available to this key tier). Caching one puts a dead entry at the head of the
-        # pool, where the classifier retries it on every tool call.
-        available = {
+        # A model can be listed, advertise generateContent, and still 404 when called.
+        # gemini-2.5-flash and gemini-2.5-flash-lite were both observed doing exactly
+        # that. Filtering on supportedGenerationMethods therefore does not predict
+        # reachability, and caching a dead model puts it at the head of the pool where
+        # the classifier spends a round-trip on it before every real classification.
+        # The only honest test is to call it, so each candidate gets one tiny request.
+        listed = {
             m["name"].replace("models/", "")
             for m in data.get("models", [])
             if "generateContent" in (m.get("supportedGenerationMethods") or [])
@@ -225,13 +228,35 @@ try:
             "gemini-3.8-flash",
             "gemma-2-27b-it",
         ]
-        active = [m for m in preferred if m in available]
+
+        def responds(model):
+            """One minimal generateContent call. Only a 2xx counts as reachable."""
+            body = json.dumps({
+                "contents": [{"parts": [{"text": "hi"}]}],
+                "generationConfig": {"maxOutputTokens": 1},
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://generativelanguage.googleapis.com/v1beta/models/"
+                + model + ":generateContent",
+                data=body,
+                headers={"x-goog-api-key": api_key, "Content-Type": "application/json"},
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    return 200 <= r.status < 300
+            except urllib.error.HTTPError as e:
+                # 429 is a live model that is merely busy; keep it in the pool.
+                return e.code == 429
+            except Exception:
+                return False
+
+        active = [m for m in preferred if m in listed and responds(m)]
         if active:
             out_file = os.path.expanduser("~/.gemini/config/verified_classifier_models.json")
             os.makedirs(os.path.dirname(out_file), exist_ok=True)
             with open(out_file, "w") as f:
                 json.dump({"models": active}, f, indent=2)
-            print("==> Verified active models on your account:", ", ".join(active[:4]))
+            print("==> Verified reachable models on your account:", ", ".join(active))
 except Exception:
     pass
 ' || true
