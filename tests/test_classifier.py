@@ -16,20 +16,74 @@ Verifies:
   - Anchored su execution
 """
 
+import json
 import os
 import sys
 import tempfile
 import unittest
+import urllib.error
+import urllib.request
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "scripts")))
 
 import permission_classifier as pc
 
 
-class TestPermissionClassifierSecurity(unittest.TestCase):
+def _no_network(*args, **kwargs):
+    raise AssertionError("test attempted a live network call")
+
+
+class HermeticTestCase(unittest.TestCase):
+    """
+    Base case pinning every ambient dependency.
+
+    The suite previously called the real Gemini API whenever GEMINI_API_KEY or
+    GOOGLE_API_KEY happened to be set, so it passed or failed depending on the
+    developer's key state (with a key: 1 failure; without: all green) and asserted
+    against live model output. Tier 2 is disabled here so the deterministic layers
+    are what is under test, and urlopen is replaced so any regression that reaches
+    the network fails loudly instead of silently phoning home.
+    """
 
     def setUp(self):
         self.workspace = "/workspace/project"
+        self._saved = {
+            "load_gemini_api_key": pc.load_gemini_api_key,
+            "record_classifier_api_call": pc.record_classifier_api_call,
+            "get_remaining_quota": pc.get_remaining_quota,
+            "urlopen": urllib.request.urlopen,
+        }
+        pc.load_gemini_api_key = lambda *a, **k: None
+        pc.record_classifier_api_call = lambda *a, **k: None
+        pc.get_remaining_quota = lambda *a, **k: pc.DAILY_LIMIT
+        urllib.request.urlopen = _no_network
+
+    def tearDown(self):
+        pc.load_gemini_api_key = self._saved["load_gemini_api_key"]
+        pc.record_classifier_api_call = self._saved["record_classifier_api_call"]
+        pc.get_remaining_quota = self._saved["get_remaining_quota"]
+        urllib.request.urlopen = self._saved["urlopen"]
+
+    def decide(self, cmd):
+        return pc.classify({
+            "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+            "workspacePaths": [self.workspace]
+        })["decision"]
+
+    def decide_tool(self, name, args):
+        return pc.classify({
+            "toolCall": {"name": name, "args": args},
+            "workspacePaths": [self.workspace]
+        })["decision"]
+
+
+class TestPermissionClassifierSecurity(HermeticTestCase):
+
+    def test_suite_is_hermetic(self):
+        """Tier 2 must be unreachable from the deterministic tests."""
+        self.assertIsNone(pc.load_gemini_api_key())
+        with self.assertRaises(AssertionError):
+            urllib.request.urlopen("https://example.com")
 
     # -----------------------------------------------------------------------
     # 1. Critical Bypass Prevention: Command Chaining & Ordering
@@ -219,34 +273,53 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
     # 5. Deterministic SSRF and Cloud Metadata Blocks
     # -----------------------------------------------------------------------
 
-    def test_ssrf_and_metadata_targets_are_hard_denied(self):
-        bad_urls = [
+    def test_cloud_metadata_targets_are_hard_denied(self):
+        metadata_urls = [
             "http://169.254.169.254/latest/meta-data",
+            "http://169.254.170.2/v2/credentials",
             "https://metadata.google.internal/computeMetadata/v1/",
-            "http://127.0.0.1:8080/secret",
-            "http://localhost:3000/api/keys",
+        ]
+        for url in metadata_urls:
+            self.assertEqual(self.decide_tool("read_url_content", {"Url": url}), "deny",
+                             f"Metadata URL was not hard denied: {url}")
+            self.assertEqual(self.decide(f"curl -s {url}"), "deny",
+                             f"Metadata command was not hard denied: curl -s {url}")
+
+    def test_local_dev_targets_are_not_blocked(self):
+        """
+        Loopback and RFC1918 were previously lumped in with cloud metadata and hard
+        denied, which made `curl http://localhost:3000` unappealable and broke the
+        single most common thing an agent does on a web project.
+        """
+        local_urls = [
+            "http://127.0.0.1:8080/api",
+            "http://localhost:3000/api/health",
             "http://0.0.0.0:8000/",
             "http://[::1]:8080/",
-            "http://192.168.1.1/admin",
-            "http://10.0.0.1/credentials",
-            "http://172.16.0.5/secrets",
+            "http://192.168.1.10/status",
+            "http://10.0.0.5/status",
+            "http://172.16.0.5/status",
         ]
-        for url in bad_urls:
-            # Test in read_url_content
-            payload = {
-                "toolCall": {"name": "read_url_content", "args": {"Url": url}},
-                "workspacePaths": [self.workspace]
-            }
-            res = pc.classify(payload)
-            self.assertEqual(res["decision"], "deny", f"SSRF URL was not hard denied: {url}")
+        for url in local_urls:
+            self.assertEqual(self.decide_tool("read_url_content", {"Url": url}), "allow",
+                             f"Local dev URL should not be blocked: {url}")
+            self.assertEqual(self.decide(f"curl -s {url}"), "allow",
+                             f"Local dev fetch should not be blocked: curl -s {url}")
+        self.assertEqual(self.decide("echo 'server on localhost:3000'"), "allow")
 
-            # Test in run_command curl
-            cmd_payload = {
-                "toolCall": {"name": "run_command", "args": {"CommandLine": f"curl -s {url}"}},
-                "workspacePaths": [self.workspace]
-            }
-            cmd_res = pc.classify(cmd_payload)
-            self.assertEqual(cmd_res["decision"], "deny", f"SSRF command was not hard denied: curl -s {url}")
+    def test_curl_upload_and_output_flags_are_not_fast_pathed(self):
+        """A local target does not license writing files or uploading a body."""
+        for cmd in [
+            "curl -o /workspace/project/out http://localhost:3000/x",
+            "curl -so out.txt http://localhost:3000/x",
+            "curl -d @/workspace/project/secret http://127.0.0.1:9/",
+            "curl --data-binary @f http://localhost/",
+            "curl -K /workspace/project/.curlrc http://localhost/",
+            "curl http://localhost:3000/x > out.txt",
+        ]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"curl write/upload was fast-pathed: {cmd}")
+        # wget saves to disk by default, so it is never fast-pathed
+        self.assertEqual(self.decide("wget http://localhost:3000/x"), "force_ask")
 
     # -----------------------------------------------------------------------
     # 6. Fail-Closed Defaults
@@ -389,6 +462,186 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
         self.assertEqual(pc.extract_json_decision('{"decision": "allow"}')["decision"], "allow")
         self.assertEqual(pc.extract_json_decision('```json\n{"decision": "deny"}\n```')["decision"], "deny")
         self.assertEqual(pc.extract_json_decision('Text\n{"decision": "ask"}\nMore text')["decision"], "ask")
+
+    # -----------------------------------------------------------------------
+    # 11. Three-State Segment Verdicts
+    # -----------------------------------------------------------------------
+
+    def test_segment_verdicts_are_three_state(self):
+        self.assertEqual(pc.classify_segment("git status")[0], "safe")
+        self.assertEqual(pc.classify_segment("git diff --ext-diff")[0], "dangerous")
+        self.assertEqual(pc.classify_segment("terraform apply")[0], "unknown")
+
+    def test_dangerous_segment_never_reaches_tier_two(self):
+        """
+        A dangerous verdict must return force_ask directly. Previously it only cleared
+        the fast-path flag and fell through to Tier 2, which was observed live to allow
+        `git log --output=`, `git diff --ext-diff` and `git submodule update --init`.
+        """
+        def exploding_tier_two(*args, **kwargs):
+            raise AssertionError("dangerous segment reached Tier 2")
+
+        saved_key, saved_ai = pc.load_gemini_api_key, pc.call_gemini_auto_classifier
+        pc.load_gemini_api_key = lambda *a, **k: "fake-key"
+        pc.call_gemini_auto_classifier = exploding_tier_two
+        try:
+            for cmd in [
+                "git fetch --upload-pack='touch /tmp/pwned' origin",
+                "git log --output=/tmp/pwned",
+                "git diff --ext-diff",
+                "git -c core.pager='sh' log",
+                "git checkout -- .",
+                "git status && git checkout -f main",
+            ]:
+                self.assertEqual(self.decide(cmd), "force_ask", f"not force_ask: {cmd}")
+        finally:
+            pc.load_gemini_api_key, pc.call_gemini_auto_classifier = saved_key, saved_ai
+
+    def test_dangerous_segment_survives_dynamic_substitution(self):
+        self.assertEqual(self.decide("git checkout -- . && echo $(date)"), "force_ask")
+
+    # -----------------------------------------------------------------------
+    # 12. `source` Is Arbitrary Execution
+    # -----------------------------------------------------------------------
+
+    def test_arbitrary_source_is_not_fast_pathed(self):
+        for cmd in ["source ./evil.sh", ". ./evil.sh", "source /workspace/project/setup.sh"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"source was fast-pathed: {cmd}")
+
+    def test_virtualenv_activation_is_allowed(self):
+        for cmd in ["source .venv/bin/activate", ". .venv/bin/activate",
+                    "source ./venv/bin/activate", "source env/bin/activate"]:
+            self.assertEqual(self.decide(cmd), "allow", f"venv activation blocked: {cmd}")
+
+    # -----------------------------------------------------------------------
+    # 13. Destructive Checkout / Switch
+    # -----------------------------------------------------------------------
+
+    def test_destructive_checkout_requires_confirmation(self):
+        for cmd in ["git checkout -- .", "git checkout .", "git checkout -f main",
+                    "git checkout --force main", "git switch --discard-changes",
+                    "git checkout --ours conflict.txt", "git checkout --theirs conflict.txt"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"destructive checkout allowed: {cmd}")
+
+    def test_branch_shaped_checkout_is_allowed(self):
+        for cmd in ["git checkout main", "git checkout -b feat/x", "git switch -c feat/x",
+                    "git switch main"]:
+            self.assertEqual(self.decide(cmd), "allow", f"benign checkout blocked: {cmd}")
+
+    def test_bare_credential_filenames_are_caught(self):
+        """
+        SENSITIVE_FILE_PATTERNS is anchored for whole-path checks, so it could not see a
+        relative credential file with trailing arguments: `cat .env` was fast-path allowed.
+        """
+        for cmd in ["cat .env", "cat .env.local", "head .env.production", "cat id_rsa",
+                    "cat server.pem", "cat tls.key", "cat credentials.json",
+                    "cat service_account.json", "grep -r . .env"]:
+            self.assertEqual(self.decide(cmd), "force_ask", f"credential read allowed: {cmd}")
+
+    def test_credential_matching_does_not_false_positive(self):
+        for cmd in ["cat README.md", "git commit -m 'document credentials handling'",
+                    "echo environment", "cat src/env.ts", "cat package.json",
+                    "cat docs/keys.md", "npm run build"]:
+            self.assertEqual(self.decide(cmd), "allow", f"false positive: {cmd}")
+
+    def test_local_bin_launchers_are_normalized(self):
+        for cmd in ["./.venv/bin/pytest tests/", ".venv/bin/pytest", "node_modules/.bin/vitest",
+                    "./node_modules/.bin/eslint src/"]:
+            self.assertEqual(self.decide(cmd), "allow", f"local bin launcher blocked: {cmd}")
+
+
+class _FakeResponse(object):
+    """Minimal stand-in for the urlopen context manager."""
+
+    def __init__(self, body):
+        self._body = body.encode("utf-8")
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class TestTierTwoPlumbing(HermeticTestCase):
+    """Exercises the Tier 2 request path with a stubbed transport. No real sockets."""
+
+    def setUp(self):
+        super(TestTierTwoPlumbing, self).setUp()
+        # Failover and quota paths log to stderr by design; keep test output readable
+        self._real_stderr = sys.stderr
+        sys.stderr = open(os.devnull, "w")
+
+    def tearDown(self):
+        sys.stderr.close()
+        sys.stderr = self._real_stderr
+        super(TestTierTwoPlumbing, self).tearDown()
+
+    def _reply(self, decision):
+        return json.dumps({
+            "candidates": [{"content": {"parts": [
+                {"text": json.dumps({"decision": decision, "reason": "stub"})}
+            ]}}]
+        })
+
+    def _run(self, responses):
+        """responses: list of str bodies or Exceptions, consumed one per model attempt."""
+        self.calls = []
+
+        def fake_urlopen(req, timeout=None):
+            self.calls.append(req.full_url)
+            item = responses[min(len(self.calls) - 1, len(responses) - 1)]
+            if isinstance(item, Exception):
+                raise item
+            return _FakeResponse(item)
+
+        urllib.request.urlopen = fake_urlopen
+        return pc.call_gemini_auto_classifier("fake-key", "objective", "some command", {"allow": []})
+
+    def test_model_decisions_map_to_hook_decisions(self):
+        for model_says, expected in (("allow", "allow"), ("ask", "force_ask"), ("deny", "deny")):
+            res = self._run([self._reply(model_says)])
+            self.assertEqual(res["decision"], expected)
+
+    def test_malformed_reply_fails_over_to_next_model(self):
+        res = self._run(["not json at all", self._reply("deny")])
+        self.assertEqual(res["decision"], "deny")
+        self.assertGreaterEqual(len(self.calls), 2)
+
+    def test_http_429_fails_over_to_next_model(self):
+        err = urllib.error.HTTPError("http://x", 429, "Too Many Requests", {}, None)
+        res = self._run([err, self._reply("allow")])
+        self.assertEqual(res["decision"], "allow")
+        self.assertGreaterEqual(len(self.calls), 2)
+
+    def test_all_models_failing_returns_none(self):
+        err = urllib.error.HTTPError("http://x", 500, "Server Error", {}, None)
+        self.assertIsNone(self._run([err]))
+
+    def test_quota_exhaustion_short_circuits_before_any_request(self):
+        pc.get_remaining_quota = lambda *a, **k: 0
+        urllib.request.urlopen = _no_network
+        self.assertIsNone(
+            pc.call_gemini_auto_classifier("fake-key", "objective", "cmd", {"allow": []}))
+
+    def test_api_key_is_sent_as_header_not_query_string(self):
+        self._run([self._reply("allow")])
+        self.assertNotIn("key=", self.calls[0])
+
+    def test_untrusted_command_is_fenced_in_prompt(self):
+        captured = {}
+
+        def capturing_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode("utf-8"))
+            return _FakeResponse(self._reply("allow"))
+
+        urllib.request.urlopen = capturing_urlopen
+        pc.call_gemini_auto_classifier("fake-key", "obj", "rm -rf /", {"allow": []})
+        sent = json.dumps(captured["body"])
+        self.assertIn("untrusted_proposed_command", sent)
 
 
 if __name__ == "__main__":

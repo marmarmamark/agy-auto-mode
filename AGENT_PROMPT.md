@@ -39,7 +39,7 @@ If you are an AI assistant executing this installation:
   The `--yes` flag ensures non-interactive execution without waiting on stdin.
 - [ ] **Step 4: Run Health Check**
   Run `python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py`.
-  All 9 tests must pass.
+  All 40 tests must pass. The suite is hermetic: it makes no network calls and needs no API key.
 - [ ] **Step 5: API Key Audit**
   Inspect if `GEMINI_API_KEY` or `GOOGLE_API_KEY` is present in `os.environ` or `~/.env`.
   - If present: Report that Tier-2 AI classification and multi-model failover are active.

@@ -1,7 +1,7 @@
 {
   "name": "agy-auto-mode",
   "description": "Claude Code-style autonomous permission classifier for Antigravity (agy). Features 3-tier safety checks, free-tier Google AI Studio cascading failover (500+ RPD), instant fast-path execution, and customizable security policies.",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "Mar",
   "license": "MIT",
   "repository": "https://github.com/marmarmamark/agy-auto-mode"

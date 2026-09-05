@@ -1,5 +1,6 @@
 # agy-auto-mode 🛡️
 
+[![tests](https://github.com/marmarmamark/agy-auto-mode/actions/workflows/test.yml/badge.svg)](https://github.com/marmarmamark/agy-auto-mode/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](https://www.python.org/)
 [![Platform: Antigravity](https://img.shields.io/badge/Antigravity-CLI%20%7C%20IDE-orange.svg)](https://github.com/google-deepmind)
@@ -25,7 +26,8 @@ Stop dealing with repetitive, disruptive confirmation prompts for routine comman
 - **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API.
 - **🛡️ Compound Command Decomposition:** Chained commands (`;`, `&&`, `||`, `|`, `\n`) are split and analyzed so every single sub-command must be on the strict allow-list.
 - **🔒 Fail-Closed By Default:** Missing schemas, unknown tools, and ambiguous offline commands default to user confirmation (`force_ask`), never silent execution.
-- **🌐 Network & SSRF Protection:** Blocks cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`), loopback, and private RFC1918 subnets.
+- **⛔ Deterministic Findings Are Final:** A construct the local rules flag as dangerous always prompts. It is never handed to the AI tier, which cannot upgrade it to `allow`.
+- **🌐 Metadata Blocking, Without Breaking Local Dev:** Cloud metadata endpoints (`169.254.169.254`, `169.254.170.2`, `metadata.google.internal`) are hard-denied. Loopback and RFC1918 are *not* blocked — reaching your own dev server is routine.
 - **🔄 Autonomous Cascading Failover:** If an AI model encounters rate limits (`HTTP 429`), it dynamically fails over to the next model in your pool within a global 5.5s latency budget.
 - **💰 100% Free Tier Supported:** Runs on Google AI Studio's free tier with generous limits (up to 1,500 requests/day). No credit card required.
 
@@ -38,12 +40,16 @@ flowchart TD
     ToolCall[Antigravity PreToolUse Event] --> FastPath{Tier 1: Fast-Path Evaluation}
     
     FastPath -->|Catastrophic Pattern e.g. rm -rf /| Deny[Instant HARD DENY 0ms]
+    FastPath -->|Cloud metadata endpoint| Deny
     FastPath -->|Dangerous Pattern e.g. sudo, git reset --hard| Ask[SOFT DENY: User Confirmation]
     FastPath -->|Sensitive Boundary e.g. ~/.ssh, /etc| Ask
     FastPath -->|Unrecognized Tool e.g. deploy_to_production| Ask
     FastPath -->|All segments verified safe e.g. git status && git diff| Allow[Instant ALLOW <2ms]
     
-    FastPath -->|Ambiguous / Novel Command| AI{Tier 2: AI Auto-Classifier}
+    FastPath --> Segments{Per-segment verdict}
+    Segments -->|dangerous e.g. git checkout -- . or source evil.sh| Ask
+    Segments -->|safe| Allow
+    Segments -->|unknown| AI{Tier 2: AI Auto-Classifier}
     
     AI -->|gemini-2.5-flash| Eval[Evaluate Goal & Active Policy]
     AI -->|HTTP 429 / Error| Failover1[Failover: gemini-2.5-flash-lite]
@@ -129,7 +135,7 @@ Get a free Google AI Studio key at [aistudio.google.com](https://aistudio.google
 
 #### 3. Verify Installation
 
-Run the test suite to verify all 16 security test cases:
+Run the test suite (38 tests, hermetic — no network, no API key required):
 
 ```bash
 python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py
@@ -144,22 +150,27 @@ The policy rules are defined in `auto_mode_rules.json`. You can customize them g
 ```json
 {
   "allow": [
-    "Inspection and read-only actions: viewing files, listing directories, search",
+    "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
     "Code modifications to files located strictly within trusted workspaces",
-    "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go",
-    "Routine git queries and local operations: git status, diff, log, branch, add, commit, checkout, switch, stash"
+    "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc, make",
+    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, and branch-shaped checkout/switch",
+    "Reading a local development server over loopback or a private subnet (plain curl fetches, no upload or file output)"
   ],
   "soft_deny": [
-    "File deletions or recursive removals (rm, rm -rf, shred)",
-    "Privileged system commands or privilege escalation (sudo, su)",
-    "Destructive git operations: git push --force, git reset --hard, git clean -f",
-    "Git execution flags: --upload-pack, --receive-pack, --exec, --output, --ext-diff",
-    "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)"
+    "File deletions or recursive directory removals (rm, rm -rf, shred)",
+    "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
+    "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f",
+    "Checkout forms that discard uncommitted work: git checkout -- <path>, git checkout ., -f/--force, --discard-changes, --ours, --theirs",
+    "Git flags that execute commands or write arbitrary files: --upload-pack, --receive-pack, --exec, --output, --ext-diff, and -c/--config overrides",
+    "git submodule update/foreach: fetches remote content and can execute hooks",
+    "Sourcing arbitrary shell scripts (source/. anything other than a virtualenv activate script)",
+    "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
+    "Modifications targeting sensitive system paths or files outside workspace roots"
   ],
   "hard_deny": [
-    "Data exfiltration of credentials, private keys, or API tokens",
-    "Requests targeting cloud metadata services (169.254.169.254, metadata.google.internal) or private subnets",
-    "Catastrophic system destruction: wiping root filesystem, formatting disk partitions"
+    "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
+    "Requests targeting cloud instance metadata services (169.254.169.254, 169.254.170.2, metadata.google.internal)",
+    "Catastrophic system destruction: wiping root filesystem, formatting disk partitions, raw device writes"
   ]
 }
 ```

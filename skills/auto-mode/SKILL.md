@@ -24,10 +24,14 @@ Every tool call passes through a **3-Tier Decision Engine**:
    - Catastrophic patterns (`rm -rf /`, raw disk format, fork bombs) are instantly **denied** with 0ms latency.
    - Dangerous commands (`sudo`, `su`, `rm -rf`, `git reset --hard`, `--upload-pack`, destructive `find`) prompt for confirmation (`force_ask`).
    - Sensitive path boundaries (`~/.ssh`, `~/.aws`, `~/.gnupg`, `/etc`) prompt for confirmation.
-   - Compound commands (chained via `;`, `&&`, `||`, `|`, `\n`) are decomposed: **every single sub-command** must be on the strict allow-list.
+   - Compound commands (chained via `;`, `&&`, `||`, `|`, `\n`) are decomposed and **each sub-command gets its own verdict** — `safe`, `dangerous`, or `unknown`.
+     - Every segment `safe` → instant allow.
+     - Any segment `dangerous` → `force_ask`, returned immediately. A dangerous verdict is **never** sent to Tier 2, so the AI cannot upgrade it to `allow`.
+     - Otherwise → escalate to Tier 2.
    - Benign developer actions (`git status`, `git diff`, `git add`, `git commit`, `pytest`, `cargo check`, etc.) are allowed instantly.
+   - Constructs that quietly destroy work or execute code are `dangerous`: `git checkout -- .` / `git checkout .` / `-f` / `--discard-changes` / `--ours` / `--theirs`, `git submodule update|foreach`, git `--upload-pack` / `--receive-pack` / `--exec` / `--output` / `--ext-diff` / `-c` overrides, and `source`/`.` of anything but a virtualenv activate script.
    - Safe workspace file modifications (`write_to_file`, `replace_file_content`) inside active workspaces are allowed. Edits outside workspaces or with missing targets fail closed.
-   - Network tools (`read_url_content`, `browser_subagent`) block SSRF/metadata endpoints (169.254.169.254, localhost, private IPs) and gate external access.
+   - Network tools (`read_url_content`, `browser_subagent`) hard-deny cloud metadata endpoints (`169.254.169.254`, `169.254.170.2`, `metadata.google.internal`). Loopback and RFC1918 are **allowed** — reading your own dev server is routine. Plain `curl` fetches at a local target are fast-pathed too, unless they upload a body or write a file (`-d`, `-F`, `-T`, `-o`, `-K`, `>`).
 
 2. **Tier 2: AI Auto-Classifier (Cascading Multi-Model Pool)**
    - Ambiguous commands or novel scripts are evaluated by Google AI Studio models using your free API key.

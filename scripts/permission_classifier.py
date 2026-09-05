@@ -74,14 +74,33 @@ SENSITIVE_FILE_PATTERNS = [
     r"(?:^|[/\\])service[-_]account.*\.json$",
 ]
 
-# SSRF and Cloud Metadata Blocklist
-SSRF_BLOCKED_PATTERNS = [
+# Bare credential filenames as they appear inside a command line. SENSITIVE_FILE_PATTERNS
+# is anchored for whole-path checks, so it cannot see `cat .env` (no leading separator,
+# trailing args after the name). This matches on shell token boundaries instead.
+SENSITIVE_FILE_TOKEN_RE = re.compile(
+    r"(?:^|[\s='\"`;|&])(?:\./)?(?:[\w.-]+/)*"
+    r"(?:\.env(?:\.[a-zA-Z0-9_-]+)?"
+    r"|id_[a-z0-9_]+(?:\.pub)?"
+    r"|[\w.-]+\.(?:pem|key)"
+    r"|credentials\.(?:json|ini)"
+    r"|service[-_]account[\w.-]*\.json)"
+    r"(?:[\s='\"`;|&:]|$)"
+)
+
+# Cloud metadata endpoints: credential-bearing, never a legitimate agent target -> hard deny
+METADATA_BLOCK_PATTERNS = [
     r"\b169\.254\.169\.254\b",            # AWS/GCP/Azure link-local metadata
+    r"\b169\.254\.170\.2\b",              # AWS ECS task metadata
     r"\bmetadata\.google\.internal\b",    # GCP metadata hostname
+]
+
+# Loopback and RFC1918. NOT blocked: reaching your own dev server is routine.
+# Kept only so callers that care (e.g. future egress policies) can identify them.
+PRIVATE_NETWORK_PATTERNS = [
     r"\b127\.\d+\.\d+\.\d+\b",            # Loopback IPv4
     r"\blocalhost\b",                     # Localhost
     r"\b0\.0\.0\.0\b",                    # All interfaces
-    r"(?:^|[^0-9a-fA-F])::1\b",           # Loopback IPv6
+    r"(?:^|[^0-9a-fA-F:])::1\b",          # Loopback IPv6
     r"\b\[::1\]\b",                       # Bracketed IPv6 loopback
     r"\b10\.\d+\.\d+\.\d+\b",             # RFC1918 Class A
     r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+\b", # RFC1918 Class B
@@ -182,10 +201,41 @@ SAFE_SEGMENT_PREFIXES = (
     "make ",
     "ruff ",
     "eslint ",
-    "source ",
     "python3 -m venv ",
     "which ",
     "echo ",
+)
+
+# `source`/`.` execute arbitrary shell in the current process, so the bare verb is never
+# safe. Only virtualenv activation is allow-listed, matched against the whole segment.
+VENV_ACTIVATE_RE = re.compile(r"^(?:source|\.)\s+(?:\./)?(?:\.venv|venv|env)/bin/activate$")
+
+# Checkout/switch forms that discard uncommitted work. Same risk class as `git reset --hard`,
+# which is already soft-denied, so these must prompt rather than fast-path.
+DESTRUCTIVE_CHECKOUT_PATTERNS = [
+    (r"\s--\s", "pathspec restore (git checkout -- <path>)"),
+    (r"^git\s+(?:checkout|switch)\s+\.$", "working-tree restore (git checkout .)"),
+    (r"\s-f\b", "forced checkout (-f)"),
+    (r"\s--force\b", "forced checkout (--force)"),
+    (r"\s--discard-changes\b", "discard local changes"),
+    (r"\s--ours\b", "conflict resolution discarding their side (--ours)"),
+    (r"\s--theirs\b", "conflict resolution discarding our side (--theirs)"),
+]
+
+# git-level `-c key=value` / `--config` overrides can repoint pagers and external tools
+GIT_CONFIG_OVERRIDE_RE = re.compile(r"\bgit\s+(?:-[a-zA-Z]*c\b|--config\b)")
+
+# curl flags that upload a body or write a file, including clustered short forms like -so.
+# -K/--config reads a curl config file that can set any other option.
+CURL_WRITE_OR_UPLOAD_RE = re.compile(
+    r"(?:^|\s)(?:-[a-zA-Z]*[dFTOoK][a-zA-Z]*\b"
+    r"|--data(?:-[a-z]+)?\b|--form\b|--upload-file\b|--output\b|--remote-name\b|--config\b)"
+)
+
+# Virtualenv / node local-bin launchers, normalized to the underlying command name
+LOCAL_BIN_RES = (
+    re.compile(r"^(?:\./)?(?:\.venv|venv|env)/bin/(.+)$"),
+    re.compile(r"^(?:\./)?node_modules/\.bin/(.+)$"),
 )
 
 # Known file edit tools
@@ -263,17 +313,28 @@ def contains_sensitive_reference(text):
         return True
     if SENSITIVE_USER_PATH_REGEX.search(text):
         return True
+    if SENSITIVE_FILE_TOKEN_RE.search(text):
+        return True
     for pattern in SENSITIVE_FILE_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
 
-def is_ssrf_or_metadata_target(url_text):
-    """Detect loopback, RFC1918 private IP, or cloud metadata service targets."""
-    if not url_text:
+def is_metadata_target(text):
+    """Detect cloud instance metadata endpoints. These are always hard-denied."""
+    if not text:
         return False
-    for pattern in SSRF_BLOCKED_PATTERNS:
-        if re.search(pattern, url_text, re.IGNORECASE):
+    for pattern in METADATA_BLOCK_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+def is_private_network_target(text):
+    """Detect loopback / RFC1918 targets. Informational only: local dev is not blocked."""
+    if not text:
+        return False
+    for pattern in PRIVATE_NETWORK_PATTERNS:
+        if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
 
@@ -287,6 +348,83 @@ def split_command_segments(cmd_line):
 def contains_dynamic_substitutions(cmd_line):
     """Detect dynamic command substitutions: $(...), `...`, <(...), >(...)."""
     return any(sub in cmd_line for sub in ("$(", "`", "<(", ">("))
+
+def classify_segment(seg):
+    """
+    Classify one command segment into a three-state verdict, returned as (verdict, reason):
+
+      "safe"      - affirmatively benign, eligible for the fast path
+      "dangerous" - affirmatively dangerous; the caller must prompt and must NOT consult
+                    Tier 2, which has been observed to allow constructs like
+                    `git log --output=` and `git diff --ext-diff` on its own judgement
+      "unknown"   - unrecognized; the caller escalates to Tier 2 / Tier 3
+
+    The distinction matters: a two-state safe/unsafe result lets every deterministic
+    finding decay into an LLM "allow".
+    """
+    seg_clean = seg.strip()
+    if not seg_clean:
+        return ("safe", "")
+
+    # Any redirection can write files, so it disqualifies an otherwise benign verb
+    has_redirect = ">" in seg_clean
+
+    if seg_clean == "git" or seg_clean.startswith("git "):
+        for flag in GIT_DANGEROUS_FLAGS:
+            if flag in seg_clean:
+                return ("dangerous", f"git flag '{flag}' can execute commands or write arbitrary files")
+        if GIT_CONFIG_OVERRIDE_RE.search(seg_clean):
+            return ("dangerous", "git -c/--config override can repoint pagers and external tools")
+        if re.match(r"^git\s+(?:checkout|switch)\b", seg_clean):
+            for pattern, desc in DESTRUCTIVE_CHECKOUT_PATTERNS:
+                if re.search(pattern, seg_clean):
+                    return ("dangerous", f"discards uncommitted work: {desc}")
+        # `submodule foreach` runs a command outright; `update` fetches remote content
+        # and checks it out, which can trigger hooks
+        if re.match(r"^git\s+submodule\s+(?:update|foreach)\b", seg_clean):
+            return ("dangerous", "git submodule update/foreach fetches remote content and can execute hooks")
+
+    # `source` / `.` run arbitrary shell in the current process; only venv activation is safe
+    if re.match(r"^(?:source|\.)\s", seg_clean):
+        if VENV_ACTIVATE_RE.match(seg_clean):
+            return ("safe", "")
+        return ("unknown", "sources an arbitrary script")
+
+    # Reading back the local dev server is the agent's most common network action.
+    # Allow plain curl fetches at loopback/RFC1918 only: no body upload, no file output.
+    # (wget is excluded because it saves to disk by default.) Pipes to a shell and
+    # credential exfiltration are already caught on the full command line above.
+    if re.match(r"^curl\b", seg_clean):
+        if (not has_redirect
+                and is_private_network_target(seg_clean)
+                and not CURL_WRITE_OR_UPLOAD_RE.search(seg_clean)):
+            return ("safe", "")
+        return ("unknown", "")
+
+    # Normalize virtualenv / node local-bin launchers to the underlying command name
+    candidate_segs = [seg_clean]
+    for local_bin_re in LOCAL_BIN_RES:
+        m_bin = local_bin_re.match(seg_clean)
+        if m_bin:
+            candidate_segs.append(m_bin.group(1).strip())
+            break
+
+    if not has_redirect:
+        for c_seg in candidate_segs:
+            if c_seg in SAFE_SEGMENT_EXACT:
+                return ("safe", "")
+            for prefix in SAFE_SEGMENT_PREFIXES:
+                if c_seg.startswith(prefix):
+                    return ("safe", "")
+
+        # File reading utilities are safe only when they touch nothing sensitive
+        for read_bin in ("cat ", "head ", "tail ", "ls ", "grep "):
+            if seg_clean.startswith(read_bin):
+                if not contains_sensitive_reference(seg_clean):
+                    return ("safe", "")
+                return ("unknown", "reads a sensitive path")
+
+    return ("unknown", "")
 
 # ---------------------------------------------------------------------------
 # Quota & API Key Management
@@ -644,8 +782,14 @@ def classify(payload):
     if tool_name in ("read_url_content", "browser_subagent"):
         url_target = tool_args.get("Url") or tool_args.get("url") or ""
         if url_target:
-            if is_ssrf_or_metadata_target(url_target) or contains_sensitive_reference(url_target):
-                return {"decision": "deny", "reason": f"Hard Deny: Blocked SSRF or metadata target: {url_target[:60]}"}
+            if is_metadata_target(url_target):
+                return {"decision": "deny", "reason": f"Hard Deny: Cloud metadata endpoint: {url_target[:60]}"}
+            if contains_sensitive_reference(url_target):
+                return {"decision": "force_ask", "reason": f"Soft Deny: URL references a sensitive path: {url_target[:60]}"}
+            # Loopback / RFC1918 is the local dev server. Allow it outright rather than
+            # spending a Tier 2 call (or a prompt) on the agent's most common request.
+            if is_private_network_target(url_target):
+                return {"decision": "allow", "reason": f"Fast-Path: Local development target: {url_target[:60]}"}
 
         api_key = load_gemini_api_key()
         if api_key:
@@ -670,9 +814,10 @@ def classify(payload):
             if re.search(pattern, cmd_line, re.IGNORECASE):
                 return {"decision": "deny", "reason": f"Hard Deny: {desc}"}
 
-        # Check SSRF / metadata requests across command line
-        if is_ssrf_or_metadata_target(cmd_line):
-            return {"decision": "deny", "reason": "Hard Deny: Command attempts to access private/metadata network targets"}
+        # Cloud metadata endpoints are always denied. Loopback and RFC1918 are NOT checked
+        # here: curl-ing your own dev server is routine and must not be blocked.
+        if is_metadata_target(cmd_line):
+            return {"decision": "deny", "reason": "Hard Deny: Command targets a cloud instance metadata endpoint"}
 
         # Check dangerous patterns across entire raw command line (BEFORE allow-list)
         for pattern, desc in OBVIOUS_DANGEROUS_PATTERNS:
@@ -683,61 +828,20 @@ def classify(payload):
         if contains_sensitive_reference(cmd_line):
             return {"decision": "force_ask", "reason": f"Soft Deny: Command references sensitive path in '{cmd_line[:50]}'"}
 
-        # Fast-Path Check: Decompose compound commands (; && || | & \n)
+        # Decompose compound commands (; && || | & \n) and classify each segment
         segments = split_command_segments(cmd_line)
-        if segments and not contains_dynamic_substitutions(cmd_line):
-            all_segments_safe = True
-            for seg in segments:
-                seg_clean = seg.strip()
-                is_seg_safe = False
+        verdicts = [classify_segment(seg) for seg in segments]
 
-                # Reject any git command containing dangerous execution/output flags or config injection
-                if seg_clean.startswith("git ") or seg_clean == "git":
-                    if any(flag in seg_clean for flag in GIT_DANGEROUS_FLAGS):
-                        all_segments_safe = False
-                        break
-                    # Reject leading -c config overrides (e.g. git -c core.pager=...)
-                    if re.search(r"\bgit\s+(?:-[a-zA-Z]*c\b|--config\b)", seg_clean):
-                        all_segments_safe = False
-                        break
+        # An affirmatively dangerous segment always prompts and never reaches Tier 2.
+        # Checked even when substitutions are present, so `git checkout -- . && $(x)`
+        # cannot launder itself past this gate.
+        for verdict, reason in verdicts:
+            if verdict == "dangerous":
+                return {"decision": "force_ask", "reason": f"Soft Deny: {reason} in '{cmd_line[:50]}'"}
 
-                # Candidate segments (direct match and normalized virtualenv/local bin paths)
-                candidate_segs = [seg_clean]
-                m_bin = re.match(r"^(?:\./)?(?:\.venv|venv|env|node_modules/\.bin)/bin/(.+)$", seg_clean)
-                if m_bin:
-                    candidate_segs.append(m_bin.group(1).strip())
-
-                for c_seg in candidate_segs:
-                    # Exact match against safe commands
-                    if c_seg in SAFE_SEGMENT_EXACT:
-                        if ">" not in seg_clean and ">>" not in seg_clean:
-                            is_seg_safe = True
-                            break
-                    else:
-                        # Prefix match against safe prefixes
-                        for prefix in SAFE_SEGMENT_PREFIXES:
-                            if c_seg.startswith(prefix):
-                                # Ensure segment doesn't contain redirection to files
-                                if ">" not in seg_clean and ">>" not in seg_clean:
-                                    is_seg_safe = True
-                                break
-                    if is_seg_safe:
-                        break
-
-                # For file reading utilities (cat, head, tail, grep, ls), verify no file redirection or sensitive paths
-                if not is_seg_safe:
-                    for read_bin in ("cat ", "head ", "tail ", "ls ", "grep "):
-                        if seg_clean.startswith(read_bin) and ">" not in seg_clean and ">>" not in seg_clean:
-                            if not contains_sensitive_reference(seg_clean):
-                                is_seg_safe = True
-                            break
-
-                if not is_seg_safe:
-                    all_segments_safe = False
-                    break
-
-            if all_segments_safe:
-                return {"decision": "allow", "reason": "Fast-Path: All command segments verified safe"}
+        if (segments and not contains_dynamic_substitutions(cmd_line)
+                and all(verdict == "safe" for verdict, _ in verdicts)):
+            return {"decision": "allow", "reason": "Fast-Path: All command segments verified safe"}
 
         # Tier 2: AI Auto-Classifier
         api_key = load_gemini_api_key()

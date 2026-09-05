@@ -6,18 +6,24 @@
   "allow": [
     "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
     "Code modifications to files located strictly within trusted workspaces",
-    "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc",
-    "Routine git queries and local non-destructive operations: git status, diff, log, branch, add, commit, checkout, stash"
+    "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc, make",
+    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, and branch-shaped checkout/switch",
+    "Reading a local development server over loopback or a private subnet (plain curl fetches, no upload or file output)"
   ],
   "soft_deny": [
     "File deletions or recursive directory removals (rm, rm -rf, shred)",
     "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
     "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f",
+    "Checkout forms that discard uncommitted work: git checkout -- <path>, git checkout ., -f/--force, --discard-changes, --ours, --theirs",
+    "Git flags that execute commands or write arbitrary files: --upload-pack, --receive-pack, --exec, --output, --ext-diff, and -c/--config overrides",
+    "git submodule update/foreach: fetches remote content and can execute hooks",
+    "Sourcing arbitrary shell scripts (source/. anything other than a virtualenv activate script)",
     "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
     "Modifications targeting sensitive system paths or files outside workspace roots"
   ],
   "hard_deny": [
     "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
+    "Requests targeting cloud instance metadata services (169.254.169.254, 169.254.170.2, metadata.google.internal)",
     "Catastrophic system destruction: wiping root filesystem, formatting disk partitions, raw device writes"
   ]
 }
