@@ -265,7 +265,28 @@ try:
             except Exception:
                 return False
 
-        active = [m for m in preferred if m in listed and responds(m)]
+        reachable = [m for m in preferred if m in listed and responds(m)]
+
+        # Same tier policy the classifier applies: flash-lite, then flash, then the
+        # Gemma reserves, newest (and largest) first within a tier. Without this the
+        # curated names outranked the discovered ones purely by list position, which
+        # put the Gemma reserves ahead of gemini-3.6-flash and gemini-3.5-flash.
+        def rank(name):
+            low = name.lower()
+            if low.startswith("gemma"):
+                tier = 2
+            elif "flash-lite" in low:
+                tier = 0
+            elif "flash" in low:
+                tier = 1
+            else:
+                tier = 3
+            vm = re.search(r"-(\d+(?:\.\d+)*)", low)
+            version = tuple(int(x) for x in vm.group(1).split(".")) if vm else ()
+            sm = re.search(r"-(\d+)b\b", low)
+            return (tier, tuple(-v for v in version), -(int(sm.group(1)) if sm else 0), low)
+
+        active = sorted(reachable, key=rank)
         if active:
             out_file = os.path.expanduser("~/.gemini/config/verified_classifier_models.json")
             os.makedirs(os.path.dirname(out_file), exist_ok=True)

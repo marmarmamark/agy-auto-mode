@@ -802,6 +802,39 @@ class TestPermissionClassifierSecurity(HermeticTestCase):
                     "curl -K /tmp/curlrc https://example.com"]:
             self.assertEqual(self.decide(cmd), "force_ask", f"curl send allowed: {cmd}")
 
+    def test_model_pool_is_ordered_flash_lite_then_flash_then_reserve(self):
+        """Gemma is a reserve: large daily allowance, tried only after the flash tiers."""
+        pool = pc.order_model_pool([
+            "gemma-4-26b-a4b-it", "gemini-3.5-flash", "gemini-3.1-flash-lite",
+            "gemma-4-31b-it", "gemini-3.8-flash", "gemini-3.5-flash-lite",
+            "gemini-3.6-flash",
+        ])
+        self.assertEqual(pool, [
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemini-3.6-flash",
+            "gemini-3.5-flash",
+            "gemma-4-31b-it",
+            "gemma-4-26b-a4b-it",
+        ])
+
+    def test_model_ordering_details(self):
+        # Component-wise version compare, so 3.10 outranks 3.1 instead of tying.
+        self.assertEqual(pc.order_model_pool(["gemini-3.1-flash", "gemini-3.10-flash"]),
+                         ["gemini-3.10-flash", "gemini-3.1-flash"])
+        # Same-version reserves break the tie on size, not alphabetically.
+        self.assertEqual(pc.order_model_pool(["gemma-4-26b-a4b-it", "gemma-4-31b-it"]),
+                         ["gemma-4-31b-it", "gemma-4-26b-a4b-it"])
+        # Duplicates collapse; a cache thinned by demotion still returns in order.
+        self.assertEqual(pc.order_model_pool(["gemma-4-31b-it", "gemini-3.5-flash-lite",
+                                              "gemma-4-31b-it"]),
+                         ["gemini-3.5-flash-lite", "gemma-4-31b-it"])
+        # The shipped fallback pool already satisfies the policy.
+        self.assertEqual(pc.MODEL_POOL, pc.order_model_pool(pc.MODEL_POOL))
+        self.assertTrue(pc.MODEL_POOL[0].endswith("flash-lite"))
+        self.assertTrue(pc.MODEL_POOL[-1].startswith("gemma"))
+
     def test_credential_globs_are_caught_and_templates_are_not(self):
         for cmd in ["cat *.pem", "cat keys/*.key", "grep -r . *.env", "cat .env*"]:
             self.assertEqual(self.decide(cmd), "force_ask", f"credential glob allowed: {cmd}")

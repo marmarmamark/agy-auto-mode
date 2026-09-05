@@ -88,9 +88,14 @@ flowchart TD
 
 | Tier | Models | Availability | Purpose |
 | :--- | :--- | :--- | :--- |
-| **Flash-Lite** | `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite` | ~500-1000 RPD | High-efficiency classification workhorses |
-| **Flash** | `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-flash` | ~100-250 RPD | Standard backups |
-| **Open Reserve** | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` | ~14,400 RPD each | High-capacity open model reserve |
+| 1. **Flash-Lite** | `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite` | ~500-1000 RPD | Tried first: high-efficiency classification workhorses |
+| 2. **Flash** | `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-flash` | ~100-250 RPD | Standard backups |
+| 3. **Open Reserve** | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` | ~14,400 RPD each | Tried last: a large allowance kept in reserve for when the Gemini tiers are rate-limited |
+
+The pool is ordered by tier, newest version first within a tier (and larger model
+first on a version tie). Gemma sits at the end deliberately — its daily allowance
+dwarfs the Gemini tiers, so it is most useful as the thing still standing once the
+others return 429.
 
 **Which of these your key can reach varies by account, so the pool is measured rather than assumed.** At install time `install.sh` lists `/v1beta/models`, adds any model matching a wanted family that the curated list does not already name (so a renamed or newly released model is still found), then makes one minimal `generateContent` call per candidate — a model can advertise `generateContent` and still return 404. Only models that actually answer are cached. At runtime, a model returning 403/404 is dropped from the pool permanently; 429 and 5xx are treated as transient and simply move to the next model.
 

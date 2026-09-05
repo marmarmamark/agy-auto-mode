@@ -40,18 +40,66 @@ SINGLE_MODEL_TIMEOUT = 2.5  # Max seconds per model attempt
 
 # Model pool: GA production models first for universal compatibility,
 # followed by high-speed / preview models and Gemma open models.
-MODEL_POOL = [
-    "gemini-2.5-flash",       # GA workhorse (stable & widely available)
-    "gemini-2.5-flash-lite",  # GA lightweight
-    "gemini-2.0-flash",       # GA fallback
-    "gemini-1.5-flash",       # GA high-reliability fallback
+# Preference tiers, cheapest and fastest first. Gemma is deliberately last: it is a
+# high-capacity reserve to fall back on, not a first choice, so its large daily
+# allowance is still there once the Gemini tiers are rate-limited or unreachable.
+MODEL_TIER_FLASH_LITE = 0
+MODEL_TIER_FLASH = 1
+MODEL_TIER_RESERVE = 2
+MODEL_TIER_OTHER = 3
+
+def model_rank(name):
+    """
+    Sort key ordering the pool: flash-lite, then flash, then Gemma reserves, with
+    the newest version first inside each tier.
+
+    Versions are compared component-wise so `3.10` sorts above `3.1` rather than
+    colliding with it the way a float would.
+    """
+    lowered = (name or "").lower()
+    if lowered.startswith("gemma"):
+        tier = MODEL_TIER_RESERVE
+    elif "flash-lite" in lowered:
+        tier = MODEL_TIER_FLASH_LITE
+    elif "flash" in lowered:
+        tier = MODEL_TIER_FLASH
+    else:
+        tier = MODEL_TIER_OTHER
+
+    match = re.search(r"-(\d+(?:\.\d+)*)", lowered)
+    version = tuple(int(part) for part in match.group(1).split(".")) if match else ()
+
+    # Same-version reserves tie on version alone, and an alphabetical tiebreak put
+    # gemma-4-26b ahead of gemma-4-31b. Prefer the larger model.
+    size_match = re.search(r"-(\d+)b\b", lowered)
+    size = int(size_match.group(1)) if size_match else 0
+
+    # Negated for descending order without needing reverse=, which would also flip
+    # the tier and the name tiebreak.
+    return (tier, tuple(-v for v in version), -size, lowered)
+
+def order_model_pool(models):
+    """Apply the tier ordering, dropping duplicates and preserving nothing else."""
+    seen = set()
+    unique = []
+    for m in models or []:
+        if m and m not in seen:
+            seen.add(m)
+            unique.append(m)
+    return sorted(unique, key=model_rank)
+
+MODEL_POOL = order_model_pool([
     "gemini-3.5-flash-lite",  # Preview workhorse
     "gemini-3.1-flash-lite",  # Preview workhorse
+    "gemini-2.5-flash-lite",  # GA lightweight
     "gemini-3.8-flash",       # Preview reasoning tier
-    "gemma-4-31b-it",         # Open reserve (high RPD)
-    "gemma-4-26b-a4b-it",     # Open reserve (high RPD)
+    "gemini-2.5-flash",       # GA workhorse
+    "gemini-2.0-flash",       # GA fallback
+    "gemini-1.5-flash",       # GA high-reliability fallback
+    "gemma-4-31b-it",         # Open reserve (high RPD), tried last
+    "gemma-4-26b-a4b-it",     # Open reserve (high RPD), tried last
     "gemma-2-27b-it",         # Older open reserve, kept for keys that still serve it
-]
+])
 
 # Approximate free-tier requests-per-day, used only to size the classifier's own
 # budget. A model missing here contributes the conservative default. The pool is
@@ -1246,7 +1294,7 @@ def get_effective_model_pool():
                 data = json.load(f)
                 cached = data.get("models", [])
                 if cached:
-                    return cached
+                    return order_model_pool(cached)
         except Exception:
             pass
     return MODEL_POOL
