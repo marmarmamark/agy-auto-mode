@@ -458,6 +458,71 @@ class TestPermissionClassifierSecurity(HermeticTestCase):
         res = pc.classify(payload)
         self.assertEqual(res["decision"], "deny")
 
+    def test_404_demotes_model_permanently(self):
+        """
+        A model the key cannot reach used to be retried on every tool call, because
+        HTTPError handling treated 404 exactly like 429. Observed as multi-second
+        classifier latency on routine commands.
+        """
+        cache = os.path.join(tempfile.mkdtemp(), "verified.json")
+        with open(cache, "w") as f:
+            json.dump({"models": ["dead-model", "live-model"]}, f)
+        saved = pc.MODELS_CACHE_FILE
+        pc.MODELS_CACHE_FILE = cache
+        try:
+            pc.demote_model("dead-model")
+            with open(cache) as f:
+                self.assertEqual(json.load(f)["models"], ["live-model"])
+        finally:
+            pc.MODELS_CACHE_FILE = saved
+
+    def test_demotion_never_empties_the_pool(self):
+        cache = os.path.join(tempfile.mkdtemp(), "verified.json")
+        with open(cache, "w") as f:
+            json.dump({"models": ["only-model"]}, f)
+        saved = pc.MODELS_CACHE_FILE
+        pc.MODELS_CACHE_FILE = cache
+        try:
+            pc.demote_model("only-model")
+            with open(cache) as f:
+                self.assertEqual(json.load(f)["models"], ["only-model"])
+        finally:
+            pc.MODELS_CACHE_FILE = saved
+
+    def test_transient_errors_do_not_demote(self):
+        """429 and 5xx are recoverable; demoting on them would erode the pool."""
+        cache = os.path.join(tempfile.mkdtemp(), "verified.json")
+        with open(cache, "w") as f:
+            json.dump({"models": ["m1", "m2"]}, f)
+        saved_cache, saved_key = pc.MODELS_CACHE_FILE, pc.load_gemini_api_key
+        pc.MODELS_CACHE_FILE = cache
+        demoted = []
+        saved_demote = pc.demote_model
+        pc.demote_model = lambda m: demoted.append(m)
+        try:
+            def fake_urlopen(req, timeout=None):
+                raise urllib.error.HTTPError("http://x", 429, "Too Many", {}, None)
+            urllib.request.urlopen = fake_urlopen
+            pc.call_gemini_auto_classifier("k", "obj", "cmd", {"allow": []})
+            self.assertEqual(demoted, [], "429 must not demote")
+        finally:
+            pc.demote_model = saved_demote
+            pc.MODELS_CACHE_FILE, pc.load_gemini_api_key = saved_cache, saved_key
+
+    def test_404_demotes_through_the_failover_path(self):
+        """Mirror of the 429 case: a permanent error must reach demote_model()."""
+        saved_demote = pc.demote_model
+        demoted = []
+        pc.demote_model = lambda m: demoted.append(m)
+        try:
+            def fake_urlopen(req, timeout=None):
+                raise urllib.error.HTTPError("http://x", 404, "Not Found", {}, None)
+            urllib.request.urlopen = fake_urlopen
+            pc.call_gemini_auto_classifier("k", "obj", "cmd", {"allow": []})
+            self.assertTrue(demoted, "404 must demote the model")
+        finally:
+            pc.demote_model = saved_demote
+
     def test_json_decision_parser(self):
         self.assertEqual(pc.extract_json_decision('{"decision": "allow"}')["decision"], "allow")
         self.assertEqual(pc.extract_json_decision('```json\n{"decision": "deny"}\n```')["decision"], "deny")

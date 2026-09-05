@@ -927,6 +927,31 @@ def load_auto_mode_rules():
         ]
     }
 
+def demote_model(model_name):
+    """
+    Permanently drop a model this API key cannot reach.
+
+    HTTP 404/403 mean the model does not exist for this key, which does not change
+    on retry. Without demotion the dead model stays at the head of the pool and is
+    re-attempted on every tool call, spending the latency budget before a working
+    model is reached — observed as multi-second hook latency on routine commands.
+    Rate limits (429) and server errors (5xx) are transient and must not demote.
+    """
+    try:
+        pool = [m for m in get_effective_model_pool() if m != model_name]
+        if not pool:
+            return  # never leave an empty pool behind
+        os.makedirs(os.path.dirname(MODELS_CACHE_FILE), exist_ok=True)
+        tmp = MODELS_CACHE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"models": pool}, f, indent=2)
+        os.replace(tmp, MODELS_CACHE_FILE)
+        sys.stderr.write(
+            "[agy-auto-mode] Model %s is unreachable for this API key; "
+            "dropped from the pool.\n" % model_name)
+    except Exception:
+        pass
+
 def get_effective_model_pool():
     """Return model pool, prioritizing cached models verified at install time."""
     if os.path.exists(MODELS_CACHE_FILE):
@@ -1099,6 +1124,9 @@ def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
                 else:
                     return {"decision": "force_ask", "reason": f"AI Auto-Mode Soft Deny ({model_name}): {reason}"}
         except urllib.error.HTTPError as e:
+            # 404/403 are permanent for this key; 429 and 5xx are transient.
+            if e.code in (403, 404):
+                demote_model(model_name)
             sys.stderr.write(f"[agy-auto-mode] Model {model_name} HTTP {e.code}, attempting failover...\n")
             continue
         except Exception as e:

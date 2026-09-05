@@ -165,7 +165,14 @@ req = urllib.request.Request(url, headers={"x-goog-api-key": api_key})
 try:
     with urllib.request.urlopen(req, timeout=5) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-        available = {m["name"].replace("models/", "") for m in data.get("models", [])}
+        # A model can be listed and still 404 on generateContent (wrong method, or not
+        # available to this key tier). Caching one puts a dead entry at the head of the
+        # pool, where the classifier retries it on every tool call.
+        available = {
+            m["name"].replace("models/", "")
+            for m in data.get("models", [])
+            if "generateContent" in (m.get("supportedGenerationMethods") or [])
+        }
         preferred = [
             "gemini-2.5-flash",
             "gemini-2.5-flash-lite",
