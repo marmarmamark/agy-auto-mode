@@ -34,7 +34,7 @@ from datetime import datetime, timezone
 # Configuration & Model Pool
 # ---------------------------------------------------------------------------
 
-DAILY_LIMIT = 1500  # Google AI Studio free tier limit
+DAILY_LIMIT = 1500  # Fallback when the reachable model pool is unknown
 GLOBAL_DEADLINE_SECS = 5.5  # Max total seconds before dropping to Tier 3 (hook timeout: 8s)
 SINGLE_MODEL_TIMEOUT = 2.5  # Max seconds per model attempt
 
@@ -48,8 +48,29 @@ MODEL_POOL = [
     "gemini-3.5-flash-lite",  # Preview workhorse
     "gemini-3.1-flash-lite",  # Preview workhorse
     "gemini-3.8-flash",       # Preview reasoning tier
-    "gemma-2-27b-it",         # GA open reserve
+    "gemma-4-31b-it",         # Open reserve (high RPD)
+    "gemma-4-26b-a4b-it",     # Open reserve (high RPD)
+    "gemma-2-27b-it",         # Older open reserve, kept for keys that still serve it
 ]
+
+# Approximate free-tier requests-per-day, used only to size the classifier's own
+# budget. A model missing here contributes the conservative default. The pool is
+# what makes this number meaningful: the open Gemma reserves carry an order of
+# magnitude more daily capacity than the Gemini flash tiers, so a pool that can
+# reach them genuinely has a far larger budget than one that cannot.
+MODEL_DAILY_CAPACITY = {
+    "gemini-2.5-flash": 250,
+    "gemini-2.5-flash-lite": 1000,
+    "gemini-2.0-flash": 200,
+    "gemini-1.5-flash": 50,
+    "gemini-3.5-flash-lite": 500,
+    "gemini-3.1-flash-lite": 500,
+    "gemini-3.8-flash": 100,
+    "gemma-4-31b-it": 14400,
+    "gemma-4-26b-a4b-it": 14400,
+    "gemma-2-27b-it": 14400,
+}
+DEFAULT_MODEL_CAPACITY = 100
 
 USAGE_FILE = os.path.expanduser("~/.gemini/config/classifier_usage.json")
 MODELS_CACHE_FILE = os.path.expanduser("~/.gemini/config/verified_classifier_models.json")
@@ -1062,6 +1083,23 @@ def classify_segment(seg, workspaces=None):
 # Quota & API Key Management
 # ---------------------------------------------------------------------------
 
+def get_daily_limit():
+    """
+    Daily classifier budget, summed over the models this key can actually reach.
+
+    A flat constant reported the same ceiling to a key with a 14,400/day Gemma
+    reserve and to one holding a single 500/day flash-lite. Falls back to the
+    flat DAILY_LIMIT when the pool cannot be read.
+    """
+    try:
+        pool = get_effective_model_pool()
+        if not pool:
+            return DAILY_LIMIT
+        total = sum(MODEL_DAILY_CAPACITY.get(m, DEFAULT_MODEL_CAPACITY) for m in pool)
+        return total or DAILY_LIMIT
+    except Exception:
+        return DAILY_LIMIT
+
 def get_remaining_quota():
     """Retrieve remaining daily AI classifier quota in sliding 24-hour window."""
     now = time.time()
@@ -1071,10 +1109,10 @@ def get_remaining_quota():
             with open(USAGE_FILE, "r") as f:
                 data = json.load(f)
                 history = [t for t in data.get("timestamps", []) if isinstance(t, (int, float)) and t > cutoff]
-                return max(0, DAILY_LIMIT - len(history))
+                return max(0, get_daily_limit() - len(history))
         except Exception:
             pass
-    return DAILY_LIMIT
+    return get_daily_limit()
 
 def record_classifier_api_call():
     """Track daily API usage count using a rolling 24-hour sliding window."""
@@ -1092,10 +1130,11 @@ def record_classifier_api_call():
     history = [t for t in history if isinstance(t, (int, float)) and t > cutoff]
     history.append(now)
 
+    daily_limit = get_daily_limit()
     usage = {
-        "daily_limit": DAILY_LIMIT,
+        "daily_limit": daily_limit,
         "used_24h": len(history),
-        "remaining": max(0, DAILY_LIMIT - len(history)),
+        "remaining": max(0, daily_limit - len(history)),
         "last_updated": datetime.now(timezone.utc).isoformat(),
         "timestamps": history
     }

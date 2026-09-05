@@ -88,12 +88,13 @@ flowchart TD
 
 | Tier | Models | Availability | Purpose |
 | :--- | :--- | :--- | :--- |
-| **GA Primary** | `gemini-2.5-flash`, `gemini-2.5-flash-lite` | General Availability | Fast, robust classification workhorses |
-| **GA Fallback** | `gemini-2.0-flash`, `gemini-1.5-flash` | General Availability | Ultra-reliable standard backups |
-| **Preview** | `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` | Preview / Tier 1 | High-efficiency 500 RPD reserves |
-| **Open Reserve** | `gemma-2-27b-it` | General Availability | High-capacity open model reserve |
+| **Flash-Lite** | `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-2.5-flash-lite` | ~500-1000 RPD | High-efficiency classification workhorses |
+| **Flash** | `gemini-3.8-flash`, `gemini-2.5-flash`, `gemini-2.0-flash`, `gemini-1.5-flash` | ~100-250 RPD | Standard backups |
+| **Open Reserve** | `gemma-4-31b-it`, `gemma-4-26b-a4b-it` | ~14,400 RPD each | High-capacity open model reserve |
 
-*(During installation, `install.sh` automatically probes `/v1beta/models` using your API key and caches verified active models).*
+**Which of these your key can reach varies by account, so the pool is measured rather than assumed.** At install time `install.sh` lists `/v1beta/models`, adds any model matching a wanted family that the curated list does not already name (so a renamed or newly released model is still found), then makes one minimal `generateContent` call per candidate — a model can advertise `generateContent` and still return 404. Only models that actually answer are cached. At runtime, a model returning 403/404 is dropped from the pool permanently; 429 and 5xx are treated as transient and simply move to the next model.
+
+The classifier's daily budget is the sum of the reachable pool's capacities, so a key that can reach the Gemma reserves is not reported as though it were limited to a single flash-lite.
 
 ---
 

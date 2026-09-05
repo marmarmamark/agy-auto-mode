@@ -197,7 +197,7 @@ fi
 if [ -n "${API_KEY:-}" ]; then
   echo "==> Probing available Gemini models for your API key..."
   PROBE_KEY="${API_KEY}" python3 -c '
-import urllib.request, urllib.error, json, os, sys
+import urllib.request, urllib.error, json, os, re, sys
 
 api_key = os.environ.get("PROBE_KEY", "").strip()
 if not api_key:
@@ -226,8 +226,23 @@ try:
             "gemini-3.5-flash-lite",
             "gemini-3.1-flash-lite",
             "gemini-3.8-flash",
+            "gemma-4-31b-it",
+            "gemma-4-26b-a4b-it",
             "gemma-2-27b-it",
         ]
+
+        # A hardcoded list cannot see a model that has been renamed or newly
+        # released: this key serves gemma-4, the list named gemma-2, and the whole
+        # high-capacity reserve tier was therefore invisible while being perfectly
+        # reachable. Anything the API lists that belongs to a family we want gets
+        # appended, so a rename costs a slower position rather than the model.
+        wanted = re.compile(r"^(?:gemini-[\d.]+-flash(?:-lite)?$|gemma-[\d.]+[\w.-]*-it$)")
+        skip = re.compile(r"(?:embedding|vision|tts|audio|image|imagen|veo|live|thinking|pro)")
+        discovered = sorted(
+            m for m in listed
+            if m not in preferred and wanted.match(m) and not skip.search(m)
+        )
+        preferred = preferred + discovered
 
         def responds(model):
             """One minimal generateContent call. Only a 2xx counts as reachable."""
