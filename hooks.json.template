@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 ~/.gemini/config/plugins/agy-auto-mode/scripts/permission_classifier.py",
+            "command": "python3 /absolute/path/to/agy-auto-mode/scripts/permission_classifier.py",
             "timeout": 8
           }
         ]

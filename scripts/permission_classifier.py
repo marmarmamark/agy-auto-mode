@@ -5,22 +5,24 @@ Antigravity Claude Code-Style Auto Mode Classifier
 PreToolUse lifecycle hook implementing an autonomous AI-driven security
 classifier inspired by Claude Code's auto-mode.
 
+Threat Model:
+  Prevents an aligned AI agent from executing catastrophic actions by accident
+  or misunderstanding. Note: commands like `npm run`, `pytest`, `cargo test`,
+  and `make` run developer code by design.
+
 Architecture:
-  - Tier 1 (Fast Path): <2ms instant evaluation. Checks catastrophic patterns,
-    dangerous commands, sensitive paths, and workspace boundaries before any allow.
-    Safely decomposes compound commands (; && || | \n) so every sub-command
-    must be verified safe.
-  - Tier 2 (AI Auto-Classifier): Evaluates ambiguous, multi-step, or novel commands
-    against auto_mode_rules.json and conversation intent using Google AI Studio models
-    with global latency deadlines, prompt-injection defense, and cascading failover.
-  - Tier 3 (Graceful Fallback): Deterministic fail-closed / heuristic fallback
-    if offline, unauthenticated, rate-limited, or on timeout.
+  - Tier 1 (Fast Path): <2ms instant evaluation. Evaluates catastrophic patterns,
+    dangerous operations, and sensitive path boundaries before allowlists.
+    Splits compound commands (; && || | & \n) ensuring every segment is verified safe.
+  - Tier 2 (AI Auto-Classifier): Evaluates ambiguous commands against active policies
+    using Google AI Studio models with global latency deadlines and injection defenses.
+  - Tier 3 (Deterministic Fallback): Fail-closed / heuristic fallback if offline,
+    unauthenticated, rate-limited, or on timeout.
 """
 
 import json
 import os
 import re
-import shlex
 import sys
 import time
 import urllib.request
@@ -31,19 +33,19 @@ from datetime import datetime, timezone
 # Configuration & Model Pool
 # ---------------------------------------------------------------------------
 
-DAILY_LIMIT = 15000  # Total daily requests across models
-GLOBAL_DEADLINE_SECS = 5.5  # Max total seconds before dropping to Tier 3 (hook timeout is 8s)
-SINGLE_MODEL_TIMEOUT = 2.5  # Max seconds per individual model attempt
+DAILY_LIMIT = 1500  # Google AI Studio free tier limit
+GLOBAL_DEADLINE_SECS = 5.5  # Max total seconds before dropping to Tier 3 (hook timeout: 8s)
+SINGLE_MODEL_TIMEOUT = 2.5  # Max seconds per model attempt
 
-# Model pool: GA production models first for universal public compatibility,
+# Model pool: GA production models first for universal compatibility,
 # followed by high-speed / preview models and Gemma open models.
 MODEL_POOL = [
     "gemini-2.5-flash",       # GA workhorse (stable & widely available)
-    "gemini-2.5-flash-lite",  # GA lightweight (fast)
+    "gemini-2.5-flash-lite",  # GA lightweight
     "gemini-2.0-flash",       # GA fallback
     "gemini-1.5-flash",       # GA high-reliability fallback
-    "gemini-3.5-flash-lite",  # Preview 500 RPD workhorse
-    "gemini-3.1-flash-lite",  # Preview 500 RPD workhorse
+    "gemini-3.5-flash-lite",  # Preview workhorse
+    "gemini-3.1-flash-lite",  # Preview workhorse
     "gemini-3.8-flash",       # Preview reasoning tier
     "gemma-2-27b-it",         # GA open reserve
 ]
@@ -51,24 +53,16 @@ MODEL_POOL = [
 USAGE_FILE = os.path.expanduser("~/.gemini/config/classifier_usage.json")
 MODELS_CACHE_FILE = os.path.expanduser("~/.gemini/config/verified_classifier_models.json")
 
-# Sensitive paths requiring explicit prompt (never fast-path allowed)
-SENSITIVE_PATHS = [
-    "~/.ssh",
-    "~/.aws",
-    "~/.gnupg",
-    "~/.kube",
-    "~/.docker",
-    "~/.netrc",
-    "~/.config/gcloud",
-    "/etc",
-    "/System",
-    "/usr/bin",
-    "/usr/sbin",
-    "/bin",
-    "/sbin",
-    "/Library",
-    "/private",
-]
+# Sensitive system path boundaries (exact or prefix boundaries, avoiding substring noise)
+SENSITIVE_SYSTEM_PATH_REGEX = re.compile(
+    r"(?:^|[\s='\"`$;|&])(?:/(?:usr/)?s?bin|/etc|/System|/Library)(?:[/\s='\"`$;|&]|$)"
+)
+
+# Sensitive user credentials & config boundaries (~/.ssh, ~/.aws, etc.)
+SENSITIVE_USER_PATH_REGEX = re.compile(
+    r"(?:^|[\s='\"`$;|&])(?:~|\$HOME|\$\{HOME\}|/Users/[^/\s'\"]+|/home/[^/\s'\"]+)"
+    r"/(?:\.ssh|\.aws|\.gnupg|\.kube|\.docker|\.netrc|\.config/gcloud)(?:[/\s='\"`$;|&]|$)"
+)
 
 # Sensitive file patterns (credentials, secrets, keys)
 SENSITIVE_FILE_PATTERNS = [
@@ -78,6 +72,20 @@ SENSITIVE_FILE_PATTERNS = [
     r"(?:^|[/\\]).*\.key$",
     r"(?:^|[/\\])credentials(?:\.json|\.ini)?$",
     r"(?:^|[/\\])service[-_]account.*\.json$",
+]
+
+# SSRF and Cloud Metadata Blocklist
+SSRF_BLOCKED_PATTERNS = [
+    r"\b169\.254\.169\.254\b",            # AWS/GCP/Azure link-local metadata
+    r"\bmetadata\.google\.internal\b",    # GCP metadata hostname
+    r"\b127\.\d+\.\d+\.\d+\b",            # Loopback IPv4
+    r"\blocalhost\b",                     # Localhost
+    r"\b0\.0\.0\.0\b",                    # All interfaces
+    r"(?:^|[^0-9a-fA-F])::1\b",           # Loopback IPv6
+    r"\b\[::1\]\b",                       # Bracketed IPv6 loopback
+    r"\b10\.\d+\.\d+\.\d+\b",             # RFC1918 Class A
+    r"\b172\.(?:1[6-9]|2\d|3[01])\.\d+\.\d+\b", # RFC1918 Class B
+    r"\b192\.168\.\d+\.\d+\b",            # RFC1918 Class C
 ]
 
 # Catastrophic patterns: Hard deny immediately (0ms)
@@ -110,7 +118,17 @@ OBVIOUS_DANGEROUS_PATTERNS = [
     (r"\bpip\s+install\s+.*--break-system-packages", "System package override"),
 ]
 
-# Benign command prefixes for individual command segments (only if no sensitive paths/args)
+# Git flags that allow command execution, external diff tools, or arbitrary file output
+GIT_DANGEROUS_FLAGS = (
+    "--upload-pack",
+    "--receive-pack",
+    "--exec",
+    "--output",
+    "--ext-diff",
+    "--config",
+)
+
+# Benign exact command matches
 SAFE_SEGMENT_EXACT = {
     "pwd",
     "git status",
@@ -118,35 +136,54 @@ SAFE_SEGMENT_EXACT = {
     "git log",
     "git branch",
     "git show",
+    "git stash",
     "git stash list",
+    "git stash pop",
+    "git stash apply",
     "git tag",
     "npm test",
     "pytest",
     "cargo check",
     "cargo test",
+    "cargo build",
     "go test",
+    "go build",
     "pnpm test",
     "yarn test",
     "vitest",
+    "tsc",
     "tsc --noEmit",
+    "docker ps",
 }
 
+# Benign segment prefixes (verified free of dangerous flags or redirection)
 SAFE_SEGMENT_PREFIXES = (
+    "git status ",
     "git diff ",
     "git log ",
     "git branch ",
     "git show ",
     "git tag ",
-    "git status ",
+    "git add ",
+    "git commit ",
+    "git checkout ",
+    "git switch ",
     "git stash ",
-    "git submodule ",
-    "git fetch ",
     "npm run ",
     "npm test ",
     "cargo check ",
     "cargo test ",
+    "cargo build ",
     "pytest ",
+    "python3 -m pytest ",
+    "python -m pytest ",
     "go test ",
+    "go build ",
+    "make ",
+    "ruff ",
+    "eslint ",
+    "source ",
+    "python3 -m venv ",
     "which ",
     "echo ",
 )
@@ -158,7 +195,7 @@ FILE_EDIT_TOOLS = {
     "multi_replace_file_content",
 }
 
-# Parameter keys used across IDEs and agents to specify file paths
+# Common path keys in tool argument schemas
 FILE_PATH_KEYS = (
     "TargetFile",
     "AbsolutePath",
@@ -183,14 +220,14 @@ def is_path_sensitive(path):
     except Exception:
         clean = os.path.abspath(os.path.expanduser(str(path).strip()))
 
-    for sp in SENSITIVE_PATHS:
-        expanded = os.path.realpath(os.path.expanduser(sp))
-        if clean == expanded or clean.startswith(expanded + os.sep):
-            return True
+    raw_path = str(path).strip()
+    if SENSITIVE_SYSTEM_PATH_REGEX.search(raw_path) or SENSITIVE_SYSTEM_PATH_REGEX.search(clean):
+        return True
+    if SENSITIVE_USER_PATH_REGEX.search(raw_path) or SENSITIVE_USER_PATH_REGEX.search(clean):
+        return True
 
-    # Check sensitive file patterns (e.g. .env, id_rsa, *.pem)
     for pattern in SENSITIVE_FILE_PATTERNS:
-        if re.search(pattern, clean, re.IGNORECASE):
+        if re.search(pattern, clean, re.IGNORECASE) or re.search(pattern, raw_path, re.IGNORECASE):
             return True
 
     return False
@@ -198,7 +235,7 @@ def is_path_sensitive(path):
 def is_path_in_workspaces(path, workspaces):
     """Fail-closed check: ensure path resolves strictly inside at least one trusted workspace."""
     if not path or not workspaces:
-        return False  # Fail-closed
+        return False
 
     try:
         real_target = os.path.realpath(os.path.expanduser(str(path).strip()))
@@ -219,37 +256,37 @@ def is_path_in_workspaces(path, workspaces):
     return False
 
 def contains_sensitive_reference(text):
-    """Scan text for any occurrence of sensitive directory paths or sensitive files."""
+    """Scan text using path boundaries to avoid false alarms on virtualenvs (.venv/bin)."""
     if not text:
         return False
-    for sp in SENSITIVE_PATHS:
-        # Match ~/... or /... sensitive path references
-        if sp in text or os.path.expanduser(sp) in text:
-            return True
+    if SENSITIVE_SYSTEM_PATH_REGEX.search(text):
+        return True
+    if SENSITIVE_USER_PATH_REGEX.search(text):
+        return True
     for pattern in SENSITIVE_FILE_PATTERNS:
         if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
 
+def is_ssrf_or_metadata_target(url_text):
+    """Detect loopback, RFC1918 private IP, or cloud metadata service targets."""
+    if not url_text:
+        return False
+    for pattern in SSRF_BLOCKED_PATTERNS:
+        if re.search(pattern, url_text, re.IGNORECASE):
+            return True
+    return False
+
 def split_command_segments(cmd_line):
-    """
-    Split compound command string into individual sub-commands while respecting quotes.
-    Splits on operators: ; && || | & \n
-    """
+    """Split compound command string on shell operators: ; && || | & \n."""
     if not cmd_line:
         return []
-
-    # Regex splitting on shell control operators outside quotes
-    # Matches ;, &&, ||, |, &, \n
     parts = re.split(r"(?:&&|\|\||[;&|\n])", cmd_line)
-    clean_parts = [p.strip() for p in parts if p and p.strip()]
-    return clean_parts
+    return [p.strip() for p in parts if p and p.strip()]
 
 def contains_dynamic_substitutions(cmd_line):
-    """Check for dynamic command substitutions like $(...), `...`, <(...), >(...)."""
-    if "$(" in cmd_line or "`" in cmd_line or "<(" in cmd_line or ">(" in cmd_line:
-        return True
-    return False
+    """Detect dynamic command substitutions: $(...), `...`, <(...), >(...)."""
+    return any(sub in cmd_line for sub in ("$(", "`", "<(", ">("))
 
 # ---------------------------------------------------------------------------
 # Quota & API Key Management
@@ -335,7 +372,7 @@ def load_gemini_api_key():
 def load_auto_mode_rules():
     """
     Load auto_mode_rules.json from trusted global/plugin locations ONLY.
-    Untrusted workspace rules are never blindly loaded to prevent hostile repo hijack.
+    Untrusted workspace rules are ignored to prevent hostile repository hijack.
     """
     candidate_paths = [
         os.path.expanduser("~/.gemini/config/auto_mode_rules.json"),
@@ -368,7 +405,7 @@ def load_auto_mode_rules():
     }
 
 def get_effective_model_pool():
-    """Return model pool, prioritizing cached models if probed at install time."""
+    """Return model pool, prioritizing cached models verified at install time."""
     if os.path.exists(MODELS_CACHE_FILE):
         try:
             with open(MODELS_CACHE_FILE, "r") as f:
@@ -433,7 +470,7 @@ def extract_json_decision(raw_text):
 # ---------------------------------------------------------------------------
 
 def fallback_heuristic_check(cmd_line):
-    """Tier 3: Deterministic safety heuristics if AI is offline or exhausted."""
+    """Tier 3: Deterministic fail-closed heuristics if AI is offline or exhausted."""
     clean_cmd = cmd_line.strip()
     for pattern, desc in CATASTROPHIC_PATTERNS:
         if re.search(pattern, clean_cmd, re.IGNORECASE):
@@ -446,7 +483,7 @@ def fallback_heuristic_check(cmd_line):
     if contains_sensitive_reference(clean_cmd):
         return {"decision": "force_ask", "reason": "Soft Deny: References sensitive path or credentials"}
 
-    return {"decision": "force_ask", "reason": "Tier-3 Fallback: Ambiguous command requires confirmation"}
+    return {"decision": "force_ask", "reason": "Tier-3 Fail-Closed: Ambiguous command requires confirmation"}
 
 def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
     """
@@ -454,13 +491,11 @@ def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
     header-based authentication, and a strict global latency budget.
     """
     if get_remaining_quota() <= 0:
-        sys.stderr.write("[agy-auto-mode] Daily AI classifier quota exhausted. Using Tier 3.\n")
+        sys.stderr.write("[agy-auto-mode] Daily AI classifier quota exhausted. Falling back to Tier 3.\n")
         return None
 
-    # Global deadline prevents hook timeout (Antigravity kills hook at 8.0s)
     deadline = time.monotonic() + GLOBAL_DEADLINE_SECS
 
-    # Active policy serialized into system instruction
     rules_json_str = json.dumps(rules, indent=2)
     system_instruction = (
         "You are an autonomous Auto-Mode Security Classifier for an AI developer pair programmer.\n"
@@ -474,7 +509,6 @@ def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
         "{\"decision\": \"allow\" | \"ask\" | \"deny\", \"reason\": \"<concise explanation>\"}"
     )
 
-    # Prompt injection escaping
     sanitized_intent = (user_intent or "General software development").replace("</user_objective>", "&lt;/user_objective&gt;")
     sanitized_cmd = cmd_line.replace("</untrusted_proposed_command>", "&lt;/untrusted_proposed_command&gt;")
 
@@ -497,8 +531,6 @@ def call_gemini_auto_classifier(api_key, user_intent, cmd_line, rules):
             break
 
         model_timeout = min(SINGLE_MODEL_TIMEOUT, remaining_time)
-
-        # API key passed via header, NOT query string
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent"
 
         if model_name.startswith("gemma"):
@@ -592,15 +624,12 @@ def classify(payload):
                 target_file = val.strip()
                 break
 
-        # Fail-closed if target cannot be verified
         if not target_file:
             return {"decision": "force_ask", "reason": f"Fail-Closed: Missing target file in edit tool '{tool_name}'"}
 
-        # Resolve symlinks and sensitive paths
         if is_path_sensitive(target_file):
             return {"decision": "force_ask", "reason": f"Soft Deny: Target file in sensitive path: {target_file}"}
 
-        # Fail-closed if workspaces is empty
         if not workspaces:
             return {"decision": "force_ask", "reason": f"Soft Deny: No trusted workspace defined for edit: {target_file}"}
 
@@ -610,16 +639,14 @@ def classify(payload):
         return {"decision": "allow", "reason": "Fast-Path: Workspace file edit allowed"}
 
     # -----------------------------------------------------------------------
-    # 3. Network & External Agent Tools: Gated (Never Unconditional Allow)
+    # 3. Network & External Agent Tools: SSRF Hard Block + AI Gate
     # -----------------------------------------------------------------------
     if tool_name in ("read_url_content", "browser_subagent"):
-        # URL inspection for exfiltration or SSRF
         url_target = tool_args.get("Url") or tool_args.get("url") or ""
         if url_target:
-            if contains_sensitive_reference(url_target) or "127.0.0.1" in url_target or "localhost" in url_target:
-                return {"decision": "force_ask", "reason": f"Soft Deny: Suspicious URL target: {url_target[:60]}"}
+            if is_ssrf_or_metadata_target(url_target) or contains_sensitive_reference(url_target):
+                return {"decision": "deny", "reason": f"Hard Deny: Blocked SSRF or metadata target: {url_target[:60]}"}
 
-        # Route through AI classifier if available
         api_key = load_gemini_api_key()
         if api_key:
             rules = load_auto_mode_rules()
@@ -636,12 +663,16 @@ def classify(payload):
     if tool_name == "run_command":
         cmd_line = (tool_args.get("CommandLine") or "").strip()
         if not cmd_line:
-            return {"decision": "allow", "reason": "Fast-Path: Empty command"}
+            return {"decision": "force_ask", "reason": "Fail-Closed: Empty command line"}
 
         # Check catastrophic patterns across entire raw command line (0ms)
         for pattern, desc in CATASTROPHIC_PATTERNS:
             if re.search(pattern, cmd_line, re.IGNORECASE):
                 return {"decision": "deny", "reason": f"Hard Deny: {desc}"}
+
+        # Check SSRF / metadata requests across command line
+        if is_ssrf_or_metadata_target(cmd_line):
+            return {"decision": "deny", "reason": "Hard Deny: Command attempts to access private/metadata network targets"}
 
         # Check dangerous patterns across entire raw command line (BEFORE allow-list)
         for pattern, desc in OBVIOUS_DANGEROUS_PATTERNS:
@@ -652,8 +683,7 @@ def classify(payload):
         if contains_sensitive_reference(cmd_line):
             return {"decision": "force_ask", "reason": f"Soft Deny: Command references sensitive path in '{cmd_line[:50]}'"}
 
-        # Fast-Path Check: Decompose compound commands (; && || | \n)
-        # Fast path is ONLY granted if EVERY segment is strictly benign and no substitutions exist
+        # Fast-Path Check: Decompose compound commands (; && || | & \n)
         segments = split_command_segments(cmd_line)
         if segments and not contains_dynamic_substitutions(cmd_line):
             all_segments_safe = True
@@ -661,19 +691,40 @@ def classify(payload):
                 seg_clean = seg.strip()
                 is_seg_safe = False
 
-                # Exact match
-                if seg_clean in SAFE_SEGMENT_EXACT:
-                    is_seg_safe = True
-                else:
-                    # Prefix match
-                    for prefix in SAFE_SEGMENT_PREFIXES:
-                        if seg_clean.startswith(prefix):
-                            # Ensure segment doesn't contain redirection to files
-                            if ">" not in seg_clean and ">>" not in seg_clean:
-                                is_seg_safe = True
-                            break
+                # Reject any git command containing dangerous execution/output flags or config injection
+                if seg_clean.startswith("git ") or seg_clean == "git":
+                    if any(flag in seg_clean for flag in GIT_DANGEROUS_FLAGS):
+                        all_segments_safe = False
+                        break
+                    # Reject leading -c config overrides (e.g. git -c core.pager=...)
+                    if re.search(r"\bgit\s+(?:-[a-zA-Z]*c\b|--config\b)", seg_clean):
+                        all_segments_safe = False
+                        break
 
-                # For file reading utilities (cat, head, tail, grep, ls), verify no sensitive paths
+                # Candidate segments (direct match and normalized virtualenv/local bin paths)
+                candidate_segs = [seg_clean]
+                m_bin = re.match(r"^(?:\./)?(?:\.venv|venv|env|node_modules/\.bin)/bin/(.+)$", seg_clean)
+                if m_bin:
+                    candidate_segs.append(m_bin.group(1).strip())
+
+                for c_seg in candidate_segs:
+                    # Exact match against safe commands
+                    if c_seg in SAFE_SEGMENT_EXACT:
+                        if ">" not in seg_clean and ">>" not in seg_clean:
+                            is_seg_safe = True
+                            break
+                    else:
+                        # Prefix match against safe prefixes
+                        for prefix in SAFE_SEGMENT_PREFIXES:
+                            if c_seg.startswith(prefix):
+                                # Ensure segment doesn't contain redirection to files
+                                if ">" not in seg_clean and ">>" not in seg_clean:
+                                    is_seg_safe = True
+                                break
+                    if is_seg_safe:
+                        break
+
+                # For file reading utilities (cat, head, tail, grep, ls), verify no file redirection or sensitive paths
                 if not is_seg_safe:
                     for read_bin in ("cat ", "head ", "tail ", "ls ", "grep "):
                         if seg_clean.startswith(read_bin) and ">" not in seg_clean and ">>" not in seg_clean:
@@ -712,7 +763,7 @@ def main():
     try:
         raw_input = sys.stdin.read()
         if not raw_input or not raw_input.strip():
-            result = {"decision": "allow", "reason": "No payload"}
+            result = {"decision": "force_ask", "reason": "Fail-Closed: Empty or missing hook payload"}
         else:
             payload = json.loads(raw_input)
             result = classify(payload)

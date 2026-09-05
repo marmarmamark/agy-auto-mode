@@ -6,7 +6,11 @@ Verifies:
   - Command chaining bypass prevention (; && || | \n)
   - Dangerous pattern prioritization before allow-lists
   - Sensitive path and file pattern detection (Tier 1)
-  - Fail-closed behavior on missing schemas and unknown tools
+  - Git dangerous flags (--upload-pack, --output, -c overrides)
+  - Path boundary matching (avoiding false alarms on virtualenvs)
+  - Routine git and developer commands on Fast-Path
+  - Deterministic SSRF and cloud metadata blocks
+  - Fail-closed behavior on missing schemas, empty inputs, and unknown tools
   - Symlink traversal and workspace boundary enforcement
   - Prompt-injection defense and rules serialization
   - Anchored su execution
@@ -109,13 +113,96 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
         self.assertNotEqual(res["decision"], "allow")
 
     # -----------------------------------------------------------------------
-    # 2. Compound Commands: Verified Safe Only When ALL Segments Safe
+    # 2. Git Execution & Output Redirection Hole Defenses
     # -----------------------------------------------------------------------
+
+    def test_git_execution_and_output_flags_are_blocked(self):
+        git_attacks = [
+            "git fetch --upload-pack='touch /tmp/pwned' origin",
+            "git fetch --receive-pack='touch /tmp/pwned' origin",
+            "git diff --output=/Users/me/project/pwned",
+            "git log --output=/tmp/pwned",
+            "git -c core.pager='sh' status",
+            "git --config core.pager='sh' log",
+            "git diff --ext-diff",
+            "git submodule update --init",
+        ]
+        for cmd in git_attacks:
+            payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                "workspacePaths": [self.workspace]
+            }
+            res = pc.classify(payload)
+            self.assertNotEqual(res["decision"], "allow", f"Git dangerous command was fast-path allowed: {cmd}")
+            self.assertEqual(res["decision"], "force_ask")
+
+    # -----------------------------------------------------------------------
+    # 3. Path Boundary Matching: No False Alarms on Virtualenvs
+    # -----------------------------------------------------------------------
+
+    def test_virtualenv_paths_do_not_trigger_sensitive_path_alarm(self):
+        venv_cmds = [
+            "source .venv/bin/activate",
+            "./.venv/bin/pytest tests/",
+            "ls /usr/local/bin",
+            "python3 -m venv .venv",
+        ]
+        for cmd in venv_cmds:
+            payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                "workspacePaths": [self.workspace]
+            }
+            res = pc.classify(payload)
+            self.assertEqual(res["decision"], "allow", f"Virtualenv command false alarm: {cmd}")
+
+    # -----------------------------------------------------------------------
+    # 4. Routine Git & Developer Commands on Fast-Path
+    # -----------------------------------------------------------------------
+
+    def test_routine_git_and_dev_commands_are_fast_path_allowed(self):
+        routine_cmds = [
+            "git status",
+            "git diff",
+            "git diff HEAD~1",
+            "git log -n 5",
+            "git branch -a",
+            "git add -A",
+            "git add src/main.ts",
+            "git commit -m 'wip'",
+            "git checkout main",
+            "git switch feature/new-page",
+            "git stash",
+            "git stash push -m 'wip'",
+            "git stash pop",
+            "git stash apply",
+            "docker ps",
+            "make build",
+            "tsc",
+            "tsc --noEmit",
+            "cargo build",
+            "cargo check",
+            "cargo test",
+            "go test ./...",
+            "go build ./...",
+            "ruff check .",
+            "eslint src/",
+            "npm test",
+            "npm run build",
+            "pytest tests/",
+            "pwd",
+        ]
+        for cmd in routine_cmds:
+            payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": cmd}},
+                "workspacePaths": [self.workspace]
+            }
+            res = pc.classify(payload)
+            self.assertEqual(res["decision"], "allow", f"Routine command failed fast-path: {cmd}")
 
     def test_safe_compound_commands_are_allowed(self):
         safe_chains = [
             "git status && git diff",
-            "git branch && git status",
+            "git add -A && git commit -m 'feat: update'",
             "pwd; git status",
             "cargo check && cargo test",
             "npm run build && npm test",
@@ -129,7 +216,40 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
             self.assertEqual(res["decision"], "allow", f"Safe compound command was rejected: {cmd}")
 
     # -----------------------------------------------------------------------
-    # 3. Fail-Closed Defaults
+    # 5. Deterministic SSRF and Cloud Metadata Blocks
+    # -----------------------------------------------------------------------
+
+    def test_ssrf_and_metadata_targets_are_hard_denied(self):
+        bad_urls = [
+            "http://169.254.169.254/latest/meta-data",
+            "https://metadata.google.internal/computeMetadata/v1/",
+            "http://127.0.0.1:8080/secret",
+            "http://localhost:3000/api/keys",
+            "http://0.0.0.0:8000/",
+            "http://[::1]:8080/",
+            "http://192.168.1.1/admin",
+            "http://10.0.0.1/credentials",
+            "http://172.16.0.5/secrets",
+        ]
+        for url in bad_urls:
+            # Test in read_url_content
+            payload = {
+                "toolCall": {"name": "read_url_content", "args": {"Url": url}},
+                "workspacePaths": [self.workspace]
+            }
+            res = pc.classify(payload)
+            self.assertEqual(res["decision"], "deny", f"SSRF URL was not hard denied: {url}")
+
+            # Test in run_command curl
+            cmd_payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": f"curl -s {url}"}},
+                "workspacePaths": [self.workspace]
+            }
+            cmd_res = pc.classify(cmd_payload)
+            self.assertEqual(cmd_res["decision"], "deny", f"SSRF command was not hard denied: curl -s {url}")
+
+    # -----------------------------------------------------------------------
+    # 6. Fail-Closed Defaults
     # -----------------------------------------------------------------------
 
     def test_unknown_tools_fail_closed(self):
@@ -173,6 +293,16 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
         self.assertEqual(res["decision"], "force_ask")
         self.assertIn("No trusted workspace", res["reason"])
 
+    def test_empty_command_line_fails_closed(self):
+        for empty_cmd in ("", "   ", None):
+            payload = {
+                "toolCall": {"name": "run_command", "args": {"CommandLine": empty_cmd}},
+                "workspacePaths": [self.workspace]
+            }
+            res = pc.classify(payload)
+            self.assertEqual(res["decision"], "force_ask", "Empty command line failed open")
+            self.assertIn("Fail-Closed", res["reason"])
+
     def test_file_edits_with_alternate_key_schemas(self):
         for key in ("AbsolutePath", "path", "file_path", "filePath", "target_file"):
             payload = {
@@ -191,7 +321,7 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
             try:
                 os.symlink(os.path.expanduser("~/.ssh"), link_path)
             except Exception:
-                return  # Skip if system permissions prevent symlinking in test runner
+                return
 
             payload = {
                 "toolCall": {
@@ -204,7 +334,7 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
             self.assertEqual(res["decision"], "force_ask", "Symlink traversal to sensitive path was not detected")
 
     # -----------------------------------------------------------------------
-    # 4. Read Tools: Sensitive & Outside Boundary Protection
+    # 7. Read Tools: Sensitive & Outside Boundary Protection
     # -----------------------------------------------------------------------
 
     def test_view_file_on_sensitive_path_is_gated(self):
@@ -223,21 +353,11 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
             res = pc.classify(payload)
             self.assertEqual(res["decision"], "force_ask", f"Sensitive file view was allowed: {sf}")
 
-    def test_read_url_content_and_browser_are_gated(self):
-        for tool in ("read_url_content", "browser_subagent"):
-            payload = {
-                "toolCall": {"name": tool, "args": {"Url": "http://127.0.0.1:8080/admin"}},
-                "workspacePaths": [self.workspace]
-            }
-            res = pc.classify(payload)
-            self.assertEqual(res["decision"], "force_ask", f"{tool} was not gated")
-
     # -----------------------------------------------------------------------
-    # 5. Anchoring & Edge Cases
+    # 8. Anchoring & Edge Cases
     # -----------------------------------------------------------------------
 
     def test_su_anchoring(self):
-        # Actual su command -> soft deny
         payload = {
             "toolCall": {"name": "run_command", "args": {"CommandLine": "su root"}},
             "workspacePaths": [self.workspace]
@@ -245,9 +365,7 @@ class TestPermissionClassifierSecurity(unittest.TestCase):
         res = pc.classify(payload)
         self.assertEqual(res["decision"], "force_ask")
 
-        # Benign word containing 'su' (e.g. submodule, consult) -> allow
         safe_cmds = [
-            "git submodule update --init",
             "echo consulting team",
             "npm run subsume",
         ]

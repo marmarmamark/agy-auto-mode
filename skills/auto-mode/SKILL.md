@@ -6,9 +6,13 @@ description: Configure and manage the autonomous permission classifier for Antig
 # Antigravity Auto-Mode Security Classifier
 
 The `auto-mode` plugin gives Antigravity CLI (`agy`) and Antigravity IDE a
-Claude Code-style **Auto-Mode Security Classifier**. It prevents repetitive,
-disruptive confirmation prompts for benign developer commands while strictly
-safeguarding your machine against destructive actions or secret leaks.
+Claude Code-style **Auto-Mode Security Classifier**.
+
+### Threat Model
+Auto-mode is designed to prevent an aligned AI coding agent from executing
+catastrophic or dangerous actions by accident or misunderstanding. Commands like
+`npm run`, `pytest`, `cargo test`, and `make` execute developer code by design.
+It is not an OS-level sandbox against a compromised model or malicious repository.
 
 --------------------------------------------------------------------------------
 
@@ -17,29 +21,36 @@ safeguarding your machine against destructive actions or secret leaks.
 Every tool call passes through a **3-Tier Decision Engine**:
 
 1. **Tier 1: Fast Path (<2ms)**
-   - All read/inspection tools (`view_file`, `list_dir`, `grep_search`) are instantly allowed.
-   - File edits (`write_to_file`, `replace_file_content`) inside your active workspace are instantly allowed.
-   - Benign developer commands (`git status`, `git diff`, `npm test`, `cargo check`, etc.) are instantly allowed.
-   - Catastrophic actions (e.g., `rm -rf /`, formatting disk devices) are instantly **denied** with 0ms latency.
+   - Catastrophic patterns (`rm -rf /`, raw disk format, fork bombs) are instantly **denied** with 0ms latency.
+   - Dangerous commands (`sudo`, `su`, `rm -rf`, `git reset --hard`, `--upload-pack`, destructive `find`) prompt for confirmation (`force_ask`).
+   - Sensitive path boundaries (`~/.ssh`, `~/.aws`, `~/.gnupg`, `/etc`) prompt for confirmation.
+   - Compound commands (chained via `;`, `&&`, `||`, `|`, `\n`) are decomposed: **every single sub-command** must be on the strict allow-list.
+   - Benign developer actions (`git status`, `git diff`, `git add`, `git commit`, `pytest`, `cargo check`, etc.) are allowed instantly.
+   - Safe workspace file modifications (`write_to_file`, `replace_file_content`) inside active workspaces are allowed. Edits outside workspaces or with missing targets fail closed.
+   - Network tools (`read_url_content`, `browser_subagent`) block SSRF/metadata endpoints (169.254.169.254, localhost, private IPs) and gate external access.
 
 2. **Tier 2: AI Auto-Classifier (Cascading Multi-Model Pool)**
    - Ambiguous commands or novel scripts are evaluated by Google AI Studio models using your free API key.
-   - Evaluates commands against your stated user objective and policy rules.
-   - **Cascading Failover**: If a model hits quota limits (HTTP 429), it automatically fails over without delay:
-     1. `gemini-3.5-flash-lite` (500 requests/day, 15 RPM)
-     2. `gemini-3.1-flash-lite` (500 requests/day, 15 RPM)
-     3. `gemini-3.5-flash` / `gemini-3.7-flash` / `gemini-3.8-flash` / `gemini-2.5-flash` (20 RPD frontier pool)
-     4. `gemma-4-31b-it` / `gemma-4-26b-a4b-it` (14,400 RPD open model reserve)
+   - Active security policies from `auto_mode_rules.json` are serialized into the model prompt.
+   - Commands are wrapped with prompt-injection defense tags `<untrusted_proposed_command>`.
+   - **Cascading Failover**: If a model hits rate limits (HTTP 429), it automatically fails over without delay:
+     1. `gemini-2.5-flash` (GA primary)
+     2. `gemini-2.5-flash-lite` (GA fast workhorse)
+     3. `gemini-2.0-flash` / `gemini-1.5-flash` (GA fallbacks)
+     4. `gemini-3.5-flash-lite` / `gemini-3.1-flash-lite` (Preview workhorses)
+     5. `gemini-3.8-flash` (Preview reasoning tier)
+     6. `gemma-2-27b-it` (Open model reserve)
+   - Runs with a strict global 5.5s timeout budget to guarantee response before Antigravity's 8.0s hook timeout.
 
-3. **Tier 3: Graceful Heuristic Fallback**
-   - If offline, unauthenticated, or on network timeout, it defaults to deterministic local heuristics.
+3. **Tier 3: Fail-Closed Heuristic Fallback**
+   - If offline, unauthenticated, rate-limited, or on timeout, it defaults to **fail-closed heuristics**: unrecognized or ambiguous commands prompt for confirmation (`force_ask`) rather than executing silently.
 
 --------------------------------------------------------------------------------
 
 ## Customizing Security Policies
 
-You can customize the rules by modifying `auto_mode_rules.json` either globally in
-`~/.gemini/config/auto_mode_rules.json` or per-project in `.agents/auto_mode_rules.json`:
+You can customize the rules globally in `~/.gemini/config/auto_mode_rules.json`
+(or edit `auto_mode_rules.json` in the plugin directory):
 
 ```json
 {
@@ -58,16 +69,19 @@ You can customize the rules by modifying `auto_mode_rules.json` either globally 
 }
 ```
 
+> [!NOTE]
+> Rules are loaded exclusively from global configuration to prevent untrusted cloned repositories from tampering with security boundaries.
+
 --------------------------------------------------------------------------------
 
 ## Managing API Keys
 
 The classifier checks for your Google AI Studio API key in:
-1. Environment variable: `export GEMINI_API_KEY="your-key-here"`
-2. Environment variable: `export GOOGLE_API_KEY="your-key-here"`
-3. `.env` file in your workspace or `~/.env`
+1. Shell environment: `export GEMINI_API_KEY="your-key-here"`
+2. Shell environment: `export GOOGLE_API_KEY="your-key-here"`
+3. User env file: `~/.env` or `~/.gemini/config/.env`
 
-Get a free key with no credit card required at: [Google AI Studio](https://aistudio.google.com/).
+Get a free key (no credit card required) at [Google AI Studio](https://aistudio.google.com/).
 
 --------------------------------------------------------------------------------
 

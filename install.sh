@@ -94,26 +94,27 @@ fi
 save_key() {
   local new_key="$1"
   touch "${ENV_FILE}"
-  python3 -c "
+  TARGET_ENV="${ENV_FILE}" KEY_VAL="${new_key}" python3 -c '
 import os
-path = os.path.expanduser('${ENV_FILE}')
+path = os.path.expanduser(os.environ["TARGET_ENV"])
+key_val = os.environ["KEY_VAL"]
 lines = []
 if os.path.exists(path):
-    with open(path, 'r') as f:
+    with open(path, "r") as f:
         lines = f.readlines()
 new_lines = []
 replaced = False
 for line in lines:
-    if line.strip().startswith('GEMINI_API_KEY='):
-        new_lines.append('GEMINI_API_KEY=\"${new_key}\"\n')
+    if line.strip().startswith("GEMINI_API_KEY="):
+        new_lines.append(f"GEMINI_API_KEY=\"{key_val}\"\n")
         replaced = True
     else:
         new_lines.append(line)
 if not replaced:
-    new_lines.append('GEMINI_API_KEY=\"${new_key}\"\n')
-with open(path, 'w') as f:
+    new_lines.append(f"GEMINI_API_KEY=\"{key_val}\"\n")
+with open(path, "w") as f:
     f.writelines(new_lines)
-"
+'
   echo "==> Saved GEMINI_API_KEY to ${ENV_FILE}"
 }
 
@@ -153,36 +154,38 @@ fi
 # Probe and cache active models if API key is present
 if [ -n "${API_KEY:-}" ]; then
   echo "==> Probing available Gemini models for your API key..."
-  python3 -c "
-import urllib.request, json, os
+  PROBE_KEY="${API_KEY}" python3 -c '
+import urllib.request, json, os, sys
 
-api_key = '${API_KEY}'
-url = 'https://generativelanguage.googleapis.com/v1beta/models'
-req = urllib.request.Request(url, headers={'x-goog-api-key': api_key})
+api_key = os.environ.get("PROBE_KEY", "").strip()
+if not api_key:
+    sys.exit(0)
+url = "https://generativelanguage.googleapis.com/v1beta/models"
+req = urllib.request.Request(url, headers={"x-goog-api-key": api_key})
 try:
     with urllib.request.urlopen(req, timeout=5) as resp:
-        data = json.loads(resp.read().decode('utf-8'))
-        available = {m['name'].replace('models/', '') for m in data.get('models', [])}
+        data = json.loads(resp.read().decode("utf-8"))
+        available = {m["name"].replace("models/", "") for m in data.get("models", [])}
         preferred = [
-            'gemini-2.5-flash',
-            'gemini-2.5-flash-lite',
-            'gemini-2.0-flash',
-            'gemini-1.5-flash',
-            'gemini-3.5-flash-lite',
-            'gemini-3.1-flash-lite',
-            'gemini-3.8-flash',
-            'gemma-2-27b-it',
+            "gemini-2.5-flash",
+            "gemini-2.5-flash-lite",
+            "gemini-2.0-flash",
+            "gemini-1.5-flash",
+            "gemini-3.5-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.8-flash",
+            "gemma-2-27b-it",
         ]
         active = [m for m in preferred if m in available]
         if active:
-            out_file = os.path.expanduser('~/.gemini/config/verified_classifier_models.json')
+            out_file = os.path.expanduser("~/.gemini/config/verified_classifier_models.json")
             os.makedirs(os.path.dirname(out_file), exist_ok=True)
-            with open(out_file, 'w') as f:
-                json.dump({'models': active}, f, indent=2)
-            print('==> Verified active models on your account:', ', '.join(active[:4]))
-except Exception as e:
+            with open(out_file, "w") as f:
+                json.dump({"models": active}, f, indent=2)
+            print("==> Verified active models on your account:", ", ".join(active[:4]))
+except Exception:
     pass
-" || true
+' || true
 fi
 
 # Verify hook execution

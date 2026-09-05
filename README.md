@@ -7,18 +7,27 @@
 
 An autonomous, Claude Code-style **Auto-Mode Security Classifier** for [Google Antigravity](https://github.com/google-deepmind) (`agy` CLI and Antigravity IDE).
 
-Stop dealing with repetitive, disruptive confirmation prompts for routine commands (`git status`, `npm test`, workspace file edits) while ensuring your system is strictly protected against catastrophic actions, accidental data loss, and credential leaks.
+Stop dealing with repetitive, disruptive confirmation prompts for routine commands (`git status`, `git diff`, `git add`, `npm test`, workspace file edits) while ensuring your system is strictly protected against catastrophic actions, accidental data loss, and credential leaks.
+
+---
+
+## Threat Model & Scope
+
+`agy-auto-mode` is designed to **prevent an aligned AI coding agent from executing catastrophic or dangerous actions by accident or misunderstanding** (such as recursive directory wipes, privilege escalation, force-pushing over remote history, or transmitting private credentials).
+
+> [!NOTE]
+> Developer tooling commands like `npm run <script>`, `pytest`, `cargo test`, `go test`, and `make` execute developer-defined code by construction (via `package.json`, `conftest.py`, `build.rs`, or `Makefile`). Auto-mode acts as an intelligent operational safety guardrail, not an operating system-level sandbox against a hostile repository or a compromised model.
 
 ---
 
 ## Key Features
 
 - **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API.
-- **🧠 3-Tier Multi-Model Security Engine:** Ambiguous or novel commands are analyzed by Google AI Studio models against your stated goal and safety policy.
-- **🔄 Autonomous Cascading Failover:** If a model encounters a rate limit (`HTTP 429`), it dynamically fails over to the next best model in your pool without interrupting execution.
-- **💰 100% Free Tier Supported:** Runs entirely on Google AI Studio's free tier with generous limits (500 to 14,400+ requests/day). No credit card required.
-- **📦 Native Antigravity Plugin:** Installs cleanly as an AGY plugin with lifecycle hook (`PreToolUse`), custom skill (`SKILL.md`), and behavioral rules (`AGENTS.md`).
-- **🛡️ Custom Security Boundaries:** Easily tweak allowed commands, confirmation triggers (soft deny), and absolute blocks (hard deny) via standard JSON.
+- **🛡️ Compound Command Decomposition:** Chained commands (`;`, `&&`, `||`, `|`, `\n`) are split and analyzed so every single sub-command must be on the strict allow-list.
+- **🔒 Fail-Closed By Default:** Missing schemas, unknown tools, and ambiguous offline commands default to user confirmation (`force_ask`), never silent execution.
+- **🌐 Network & SSRF Protection:** Blocks cloud metadata endpoints (`169.254.169.254`, `metadata.google.internal`), loopback, and private RFC1918 subnets.
+- **🔄 Autonomous Cascading Failover:** If an AI model encounters rate limits (`HTTP 429`), it dynamically fails over to the next model in your pool within a global 5.5s latency budget.
+- **💰 100% Free Tier Supported:** Runs on Google AI Studio's free tier with generous limits (up to 1,500 requests/day). No credit card required.
 
 ---
 
@@ -26,38 +35,40 @@ Stop dealing with repetitive, disruptive confirmation prompts for routine comman
 
 ```mermaid
 flowchart TD
-    ToolCall[Antigravity PreToolUse Event] --> FastPath{Tier 1: Fast-Path Check}
+    ToolCall[Antigravity PreToolUse Event] --> FastPath{Tier 1: Fast-Path Evaluation}
     
-    FastPath -->|Safe inspection tool| Allow[Instant ALLOW <2ms]
-    FastPath -->|Workspace file edit| Allow
-    FastPath -->|Routine dev command e.g. git status, npm test| Allow
-    FastPath -->|Catastrophic pattern e.g. rm -rf /| Deny[Instant HARD DENY 0ms]
-    FastPath -->|Dangerous pattern e.g. sudo, git reset --hard| Ask[SOFT DENY: Ask User]
+    FastPath -->|Catastrophic Pattern e.g. rm -rf /| Deny[Instant HARD DENY 0ms]
+    FastPath -->|Dangerous Pattern e.g. sudo, git reset --hard| Ask[SOFT DENY: User Confirmation]
+    FastPath -->|Sensitive Boundary e.g. ~/.ssh, /etc| Ask
+    FastPath -->|Unrecognized Tool e.g. deploy_to_production| Ask
+    FastPath -->|All segments verified safe e.g. git status && git diff| Allow[Instant ALLOW <2ms]
     
     FastPath -->|Ambiguous / Novel Command| AI{Tier 2: AI Auto-Classifier}
     
-    AI -->|Model 1: gemini-3.5-flash-lite 500 RPD| Eval[Evaluate Goal & Policy]
-    AI -->|HTTP 429 Rate Limit| Failover1[Failover: gemini-3.1-flash-lite 500 RPD]
-    Failover1 -->|HTTP 429 Rate Limit| Failover2[Failover: gemini-3.5/3.7/3.8-flash 20 RPD]
-    Failover2 -->|HTTP 429 Rate Limit| Failover3[Failover: gemma-4-31b-it 14,400 RPD]
+    AI -->|gemini-2.5-flash| Eval[Evaluate Goal & Active Policy]
+    AI -->|HTTP 429 / Error| Failover1[Failover: gemini-2.5-flash-lite]
+    Failover1 -->|HTTP 429 / Error| Failover2[Failover: gemini-2.0-flash / 1.5-flash]
+    Failover2 -->|HTTP 429 / Error| Failover3[Failover: gemini-3.5-flash-lite / 3.1-flash-lite]
     
     Eval -->|Safe & Aligned| Allow
     Eval -->|Risky / Deviant| Ask
     Eval -->|Dangerous / Exfiltration| Deny
     
-    AI -->|Offline / Timeout / Exhausted| Heuristic{Tier 3: Heuristic Fallback}
-    Heuristic -->|Safe Dev Action| Allow
-    Heuristic -->|Unrecognized Risk| Ask
+    AI -->|Timeout 5.5s / Quota Exhausted| Heuristic{Tier 3: Heuristic Fallback}
+    Heuristic -->|Fail-Closed: Ambiguous Action| Ask
+    Heuristic -->|Catastrophic Action| Deny
 ```
 
 ### Cascading Model Pool (Free Tier Quota)
 
-| Priority | Model | Free Tier Quota | Purpose |
+| Tier | Models | Availability | Purpose |
 | :--- | :--- | :--- | :--- |
-| **1 (Primary)** | `gemini-3.5-flash-lite` | 500 requests/day (15 RPM) | Ultra-fast, intelligent classification workhorse |
-| **2 (Secondary)** | `gemini-3.1-flash-lite` | 500 requests/day (15 RPM) | Instant secondary failover |
-| **3 (Frontier)** | `gemini-3.5-flash` / `3.7-flash` / `3.8-flash` | 20 requests/day each | Frontier reasoning fallback reserve |
-| **4 (Open Pool)** | `gemma-4-31b-it` / `gemma-4-26b-a4b-it` | 14,400 requests/day each | High-capacity open model reserve |
+| **GA Primary** | `gemini-2.5-flash`, `gemini-2.5-flash-lite` | General Availability | Fast, robust classification workhorses |
+| **GA Fallback** | `gemini-2.0-flash`, `gemini-1.5-flash` | General Availability | Ultra-reliable standard backups |
+| **Preview** | `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite` | Preview / Tier 1 | High-efficiency 500 RPD reserves |
+| **Open Reserve** | `gemma-2-27b-it` | General Availability | High-capacity open model reserve |
+
+*(During installation, `install.sh` automatically probes `/v1beta/models` using your API key and caches verified active models).*
 
 ---
 
@@ -73,7 +84,7 @@ Copy and paste this prompt directly into your AI assistant:
 > 3. Test: `python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py`
 > 4. Check if `GEMINI_API_KEY` is in `~/.env` or environment; if missing, remind me to get a free key from https://aistudio.google.com/."**
 
-*(See [AGENT_PROMPT.md](AGENT_PROMPT.md) for full agent execution checklists).*
+*(See [AGENT_PROMPT.md](AGENT_PROMPT.md) for agent execution checklists).*
 
 ---
 
@@ -95,83 +106,72 @@ cd agy-auto-mode
 bash install.sh --global
 ```
 
-*(To install only for a single project, run `bash install.sh --workspace` inside your project root).*
-
-### 2. Configure Your Free API Key
+#### 2. Configure Your Free API Key
 
 The installer automatically checks for existing keys in your environment and prompts you:
 ```text
  Detected existing Gemini API key: AIzaSy...xxxx
  Use detected key? [Y/n]: 
 ```
-- If you answer `n`, you can enter a new key which is safely saved to `~/.env`.
-- If no key is detected, you can paste one or press Enter to run in local heuristic-only mode.
+- If you answer `n`, you can enter a new key which is saved to `~/.env`.
+- If no key is detected, you can paste one or press Enter to run in local fail-closed heuristic mode.
 
 You can also manually export it in your shell (`~/.zshrc` or `~/.bashrc`):
-
 ```bash
 export GEMINI_API_KEY="your_api_key_here"
 ```
-
 Or place it in your `~/.env` file:
-
 ```dotenv
 GEMINI_API_KEY=your_api_key_here
 ```
 
 Get a free Google AI Studio key at [aistudio.google.com](https://aistudio.google.com/) (free tier, no credit card required).
 
-### 3. Verify Installation
+#### 3. Verify Installation
 
-Run the automated test suite to ensure the hook and safety checks are functioning:
+Run the test suite to verify all 16 security test cases:
 
 ```bash
 python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py
-```
-
-You should see:
-```text
-Ran 8 tests in 0.003s
-
-OK
 ```
 
 ---
 
 ## Customizing Security Policies
 
-The policy rules are defined in `auto_mode_rules.json`. You can customize them globally at `~/.gemini/config/plugins/agy-auto-mode/auto_mode_rules.json` or per project at `.agents/auto_mode_rules.json`.
+The policy rules are defined in `auto_mode_rules.json`. You can customize them globally at `~/.gemini/config/auto_mode_rules.json` (or inside the plugin directory):
 
 ```json
 {
-  "environment": [
-    "Primary use: software development in macOS/Linux",
-    "Sensitive paths: ~/.ssh, ~/.aws, ~/.gnupg, /etc, /System"
-  ],
   "allow": [
-    "Inspection and read-only actions: viewing files, listing directories, search, documentation",
+    "Inspection and read-only actions: viewing files, listing directories, search",
     "Code modifications to files located strictly within trusted workspaces",
     "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go",
-    "Routine git queries and local operations: git status, diff, log, branch, add, commit, checkout"
+    "Routine git queries and local operations: git status, diff, log, branch, add, commit, checkout, switch, stash"
   ],
   "soft_deny": [
     "File deletions or recursive removals (rm, rm -rf, shred)",
     "Privileged system commands or privilege escalation (sudo, su)",
-    "Destructive git operations that discard history: git push --force, git reset --hard, git clean -f",
+    "Destructive git operations: git push --force, git reset --hard, git clean -f",
+    "Git execution flags: --upload-pack, --receive-pack, --exec, --output, --ext-diff",
     "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)"
   ],
   "hard_deny": [
     "Data exfiltration of credentials, private keys, or API tokens",
+    "Requests targeting cloud metadata services (169.254.169.254, metadata.google.internal) or private subnets",
     "Catastrophic system destruction: wiping root filesystem, formatting disk partitions"
   ]
 }
 ```
 
+> [!NOTE]
+> Rules are loaded exclusively from global configuration (`~/.gemini/config/`) to prevent untrusted cloned repositories from tampering with security boundaries.
+
 ---
 
 ## Statusline Integration
 
-If you use a custom statusline for `agy`, you can track your remaining daily classifier requests by reading `~/.gemini/config/classifier_usage.json`:
+Track remaining daily requests by inspecting `~/.gemini/config/classifier_usage.json`:
 
 ```python
 import json, os, time
@@ -184,21 +184,11 @@ def get_classifier_remaining():
                 data = json.load(f)
                 cutoff = time.time() - 86400
                 timestamps = [t for t in data.get("timestamps", []) if t > cutoff]
-                return max(0, data.get("daily_limit", 15000) - len(timestamps))
+                return max(0, data.get("daily_limit", 1500) - len(timestamps))
         except Exception:
             pass
-    return 15000
+    return 1500
 ```
-
----
-
-## Contributing & Development
-
-Contributions are welcome! If you find edge cases or new safe command patterns:
-
-1. Fork this repository.
-2. Add new test cases in `tests/test_classifier.py`.
-3. Submit a Pull Request.
 
 ---
 
