@@ -2,7 +2,7 @@
 
 [![tests](https://github.com/marmarmamark/agy-auto-mode/actions/workflows/test.yml/badge.svg)](https://github.com/marmarmamark/agy-auto-mode/actions/workflows/test.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python: 3.8+](https://img.shields.io/badge/Python-3.8+-brightgreen.svg)](https://www.python.org/)
+[![Python: 3.9+](https://img.shields.io/badge/Python-3.9+-brightgreen.svg)](https://www.python.org/)
 [![Platform: Antigravity](https://img.shields.io/badge/Antigravity-CLI%20%7C%20IDE-orange.svg)](https://github.com/google-deepmind)
 [![Free Tier: 100% Free](https://img.shields.io/badge/Google%20AI%20Studio-Free%20Tier-success.svg)](https://aistudio.google.com/)
 
@@ -12,19 +12,34 @@ Stop dealing with repetitive, disruptive confirmation prompts for routine comman
 
 ---
 
+## Requirements
+
+| Dependency | Required? | Why | Get it |
+| :--- | :--- | :--- | :--- |
+| **Google Antigravity (`agy`)** | **Required** | This is an Antigravity plugin. Antigravity is what invokes the `PreToolUse` hook, so without it the plugin never runs. | [antigravity.google](https://antigravity.google/) |
+| **Python 3.9+** | **Required** | The classifier is a single stdlib-only script with no third-party packages. | [python.org](https://www.python.org/) |
+| **Google AI Studio API key** | Optional | Enables Tier 2 AI classification of ambiguous commands. Without a key the classifier runs Tier 1 + Tier 3 only and fails closed (prompts) on anything ambiguous — safe, just chattier. Free tier, no credit card. | [aistudio.google.com](https://aistudio.google.com/) |
+
+`install.sh` checks for each of these and points you at the download rather than
+installing a hook that silently never fires.
+
+---
+
 ## Threat Model & Scope
 
 `agy-auto-mode` is designed to **prevent an aligned AI coding agent from executing catastrophic or dangerous actions by accident or misunderstanding** (such as recursive directory wipes, privilege escalation, force-pushing over remote history, or transmitting private credentials).
 
 > [!NOTE]
-> Developer tooling commands like `npm run <script>`, `pytest`, `cargo test`, `go test`, and `make` execute developer-defined code by construction (via `package.json`, `conftest.py`, `build.rs`, or `Makefile`). Restoring already-declared dependencies (`npm ci`, `pip install -r`) runs that same code. Auto-mode acts as an intelligent operational safety guardrail, not an operating system-level sandbox against a hostile repository or a compromised model.
+> Developer tooling commands like `npm run <script>`, `pytest`, `cargo test`, `go test`, and `make` execute developer-defined code by construction (via `package.json`, `conftest.py`, `build.rs`, or `Makefile`). Installing dependencies (`npm ci`, `npm install <pkg>`, `pip install`) runs that same code, which is why it shares their treatment. Auto-mode acts as an intelligent operational safety guardrail, not an operating system-level sandbox against a hostile repository or a compromised model.
 
 ---
 
 ## Key Features
 
-- **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API. The deterministic allow-list covers everyday development end to end — read-only utilities (`ls`, `cat`, `rg`, `jq`, `sed -n`, `find`, `awk`), read-only git (`rev-parse`, `ls-files`, `blame`, `remote -v`, `config --get`, `fetch`), build and test runners, lockfile dependency restores, pipes, `2>&1` redirection, env-prefixed and `timeout`-wrapped commands, and workspace-relative writes (`mkdir`, `touch`, `cp`, `mv`, `sed -i`, `> file`).
-- **🎯 Prompts Only Where It Matters:** Because Tier 1 recognizes the routine work, confirmation is reserved for what actually carries risk. Against a 121-command corpus of everyday development commands the fast path allows 100% with no AI call; against a 55-command corpus of destructive, exfiltrating and bypass-shaped commands it allows none.
+- **⚡ Fast-Path Execution (<2ms):** Routine commands, inspections, builds, tests, and workspace file modifications execute instantly without calling any external API. The deterministic allow-list covers everyday development end to end — read-only utilities (`ls`, `cat`, `rg`, `jq`, `sed -n`, `find`, `awk`), read-only git plus `fetch`/`pull`/`merge`, build and test runners, dependency installs (`npm install <pkg>`, `pip install`, `cargo add`, `go get`), inline data one-liners (`python3 -c`, `node -e`), plain `curl` GETs, build-artifact cleanup (`rm -rf node_modules`, `dist`, `build`), `/tmp` scratch work, pipes, `2>&1` redirection, env-prefixed and `timeout`-wrapped commands, and workspace-relative writes (`mkdir`, `touch`, `cp`, `mv`, `sed -i`, `> file`).
+- **🎯 Prompts Only Where It Matters:** Because Tier 1 recognizes the routine work, confirmation is reserved for what actually carries risk. Against an 81-command corpus of everyday development commands the fast path allows 100% with no AI call; against a 67-command corpus of destructive, exfiltrating and bypass-shaped commands (including alias-laundered inline code and `/tmp/../etc` traversal) it allows none.
+- **🧠 Inline Code Judged By What It Does:** `python3 -c` and `node -e` are how an agent reads a JSON field or reformats a string, so they run on the fast path — unless the program text reaches the shell, the network, the environment, or the filesystem. Aliasing does not help: `import os as o; o.system(...)` is matched on the call shape, not the module name.
+- **🧹 Scoped Destructive Exemptions:** `rm -rf` is routine for build output (`node_modules`, `dist`, `target`, `__pycache__`) inside the workspace and for genuine `/tmp` scratch. Every path is resolved before it is judged, so `rm -rf /tmp/../etc` is the deletion of `/etc` that it actually is, and `rm -rf ~/dist` is not the same command as `rm -rf ./dist`.
 - **🔎 Substitution-Aware:** `$(...)`, backticks and `<(...)` no longer disqualify a command wholesale — the body is extracted and classified in its own right, so `cd $(git rev-parse --show-toplevel)` runs while `echo $(git checkout -- .)` still prompts.
 - **🛡️ Compound Command Decomposition:** Chained commands (`;`, `&&`, `||`, `|`, `\n`) are split and analyzed so every single sub-command must be on the strict allow-list.
 - **🔒 Fail-Closed By Default:** Missing schemas, unknown tools, and ambiguous offline commands default to user confirmation (`force_ask`), never silent execution.
@@ -139,10 +154,10 @@ Get a free Google AI Studio key at [aistudio.google.com](https://aistudio.google
 
 #### 3. Verify Installation
 
-Run the test suite (55 tests, hermetic — no network, no API key required):
+Run the test suite (hermetic — no network, no API key required):
 
 ```bash
-python3 ~/.gemini/config/plugins/agy-auto-mode/tests/test_classifier.py
+cd ~/.gemini/config/plugins/agy-auto-mode && python3 -m unittest discover -s tests -v
 ```
 
 ---
@@ -156,15 +171,17 @@ The policy rules are defined in `auto_mode_rules.json`. You can customize them g
   "allow": [
     "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
     "Read-only shell utilities: ls, cat, head, tail, wc, stat, du, df, tree, find, grep, rg, sed -n, awk, jq, sort, uniq, cut, diff, which, date",
-    "Code modifications to files located strictly within trusted workspaces, including workspace-relative mkdir, touch, cp, mv, sed -i and output redirection",
+    "Code modifications to files located strictly within trusted workspaces or /tmp, including mkdir, touch, cp, mv, sed -i and output redirection",
     "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc, make",
-    "Restoring already-declared dependencies from a committed manifest or lockfile: npm ci, npm install, pip install -r, poetry install, go mod download",
-    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, fetch, rev-parse, ls-files, blame, remote -v, config --get, and branch-shaped checkout/switch",
-    "Redirecting output to /dev/null or a workspace-relative file, and descriptor duplication such as 2>&1",
-    "Reading a local development server over loopback or a private subnet (plain curl fetches, no upload or file output)"
+    "Restoring and adding project dependencies: npm ci, npm install, pnpm add, yarn add, bun add, pip install, poetry add/install, cargo add, go get/mod",
+    "Executing inline interpreter code for data inspection, JSON manipulation, testing, and formatting: python -c, python3 -c, node -e, ruby -e (without credential or system file access)",
+    "Routine git queries and local operations: git status, diff, log, branch, add, commit, stash, fetch, merge, pull, rev-parse, ls-files, blame, remote -v, config --get, and branch-shaped checkout/switch",
+    "Removing workspace scratch files, temporary files, local build artifacts, and files in /tmp: rm <file>, rm -rf /tmp/..., rm -rf build, dist, target, .cache, __pycache__",
+    "Redirecting output to /dev/null, /tmp, or a workspace-relative file, and descriptor duplication such as 2>&1",
+    "Reading web resources, documentation, public APIs, and dev servers over HTTP/HTTPS via curl (plain GET fetches, no upload or shell piping)"
   ],
   "soft_deny": [
-    "File deletions or recursive directory removals (rm, rm -rf, shred)",
+    "Catastrophic, root, or whole-repository directory deletions (rm -rf /, rm -rf ~, rm -rf ., rm -rf /workspace, shred)",
     "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
     "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f, git restore, git stash drop/clear",
     "Checkout forms that discard uncommitted work: git checkout -- <path>, git checkout ., -f/--force, --discard-changes, --ours, --theirs",
@@ -172,11 +189,11 @@ The policy rules are defined in `auto_mode_rules.json`. You can customize them g
     "git submodule update/foreach: fetches remote content and can execute hooks",
     "Git commands that rewrite repository configuration or remotes: git config <set>, git remote add/set-url",
     "Environment assignments that redirect which binary or interpreter hook runs: PATH, LD_PRELOAD, DYLD_*, NODE_OPTIONS, PYTHONPATH, BASH_ENV, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, IFS",
-    "Installing new packages that are not already declared in the project manifest, and any global install (-g, --global)",
-    "Inline interpreter code (python -c, node -e) and text-tool programs that shell out (awk system(), sed e/w/f)",
+    "Global package installations that modify system-wide environments (-g, --global, --break-system-packages)",
+    "Inline interpreter code or scripts that attempt privilege escalation, exfiltrate private credentials, or modify system files",
     "Sourcing arbitrary shell scripts (source/. anything other than a virtualenv activate script)",
     "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
-    "Modifications, redirections or copies targeting sensitive system paths or any path outside workspace roots"
+    "Modifications, redirections or copies targeting sensitive system paths (~/.ssh, ~/.aws, /etc, /System) or external directories outside workspace roots and /tmp"
   ],
   "hard_deny": [
     "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
@@ -211,6 +228,19 @@ def get_classifier_remaining():
             pass
     return 1500
 ```
+
+---
+
+## Related Tools
+
+`agy-auto-mode` is one of four independent tools for Antigravity. Each works on
+its own, and two of them read state this plugin writes.
+
+| Tool | What it does |
+| :--- | :--- |
+| [**agy-statusline**](https://github.com/marmarmamark/agy-statusline) | Renders the `Auto: N left` segment from this plugin's `classifier_usage.json` ledger (see [Statusline Integration](#statusline-integration)). |
+| [**gemini-worker**](https://github.com/marmarmamark/gemini-worker) | Requires this classifier before it will pass `--dangerously-skip-permissions` to headless `agy` — the hook is what still vetoes tool calls once the prompts are skipped. |
+| [**agy-auto-resume**](https://github.com/marmarmamark/agy-auto-resume) | Waits out a 100% 5-hour quota and resumes the session automatically. |
 
 ---
 

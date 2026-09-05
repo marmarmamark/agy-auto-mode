@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Dependency installs run on the fast path (`npm install <pkg>`, `pnpm add`, `yarn add`, `bun add`, `pip install`, `poetry add`, `cargo add`, `go get`). Global installs (`-g`, `--global`, `--break-system-packages`) and remote or VCS sources (`git+`, a URL) still prompt.
+- Inline interpreter one-liners (`python3 -c`, `node -e`) run on the fast path when the program text stays clear of the shell, the network, the environment, and the filesystem. Aliased escapes are matched on the call shape, so `import os as o; o.system(...)` is caught where a module-name match would miss it.
+- `rm -rf` of build artifacts (`node_modules`, `dist`, `build`, `out`, `target`, `coverage`, `__pycache__`, `.cache`, `.next`, `.pytest_cache`, `.mypy_cache`, `.ruff_cache`, `.tox`, `.gradle`) inside the workspace, and reads/writes/removals under a genuine `/tmp`.
+- Plain `curl` GETs to any host, not only loopback and RFC1918. Uploads (`-d`, `-F`, `-T`), file output (`-o`, `-O`, `-K`), non-GET methods, and `curl | sh` still prompt or deny.
+- `git pull` and `git merge` on the fast path, alongside the existing `git fetch`.
+
+### Fixed
+- **Security: the `/tmp` exemption was a textual lookahead, so `rm -rf /tmp/../etc` read as a `/tmp` path and was allowed outright.** Operands are now resolved with `realpath` before they are judged.
+- **Security: the recursive-deletion pattern never matched the form people actually type.** `\brm\s+-[a-zA-Z]*r\b` required the flag cluster to end in `r`, so `rm -fr x` matched and `rm -rf x` did not, and the companion `rm -...f` rule had been deleted. `rm` is now owned entirely by the segment classifier, which resolves paths instead of pattern-matching them.
+- Command segmentation is quote-aware. A `;` or `|` inside a quoted string was treated as a separator, shredding `python3 -c 'import json; print(x)'` into nonsense segments that then failed closed. An unterminated quote falls back to the previous naive split, which over-segments and so can only prompt more, never less.
+- Write commands with mixed operands (`mv src /tmp/stash`) are judged per operand instead of requiring every operand to satisfy the same rule, which previously meant a workspace/temp pair satisfied neither.
+
 ## [1.1.0] - 2026-09-05
 
 ### Added

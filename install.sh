@@ -43,6 +43,48 @@ fi
 PYTHON_VERSION=$(python3 -c 'import sys; print(f"{sys.version_info.major}.{sys.version_info.minor}")')
 echo "==> Detected Python: ${PYTHON_VERSION}"
 
+# Antigravity itself is the host for this plugin: without agy there is nothing to
+# invoke the PreToolUse hook, so the install would appear to succeed and do nothing.
+ANTIGRAVITY_URL="https://antigravity.google/"
+
+agy_installed() {
+  command -v agy >/dev/null 2>&1 && return 0
+  for c in "${HOME}/.local/bin/agy" \
+           "${HOME}/.antigravity-ide/antigravity-ide/bin/agy" \
+           "/usr/local/bin/agy" \
+           "/opt/homebrew/bin/agy"; do
+    [ -x "${c}" ] && return 0
+  done
+  return 1
+}
+
+if agy_installed; then
+  echo "==> Detected Antigravity CLI (agy)"
+else
+  echo ""
+  echo "------------------------------------------------------------------"
+  echo " Missing dependency: Google Antigravity (agy)"
+  echo ""
+  echo " agy-auto-mode is an Antigravity plugin. Antigravity is what invokes"
+  echo " the PreToolUse hook, so without it this plugin never runs."
+  echo ""
+  echo " Download Antigravity: ${ANTIGRAVITY_URL}"
+  echo "------------------------------------------------------------------"
+  if [ -t 0 ] && [ "${AUTO_CONFIRM}" = false ]; then
+    read -r -p " Install the plugin anyway (ready for when agy is installed)? [y/N]: " CONTINUE_NO_AGY
+    case "${CONTINUE_NO_AGY}" in
+      [Yy]*) echo "==> Continuing without agy." ;;
+      *)
+        echo "==> Aborted. Install Antigravity first, then re-run this installer."
+        exit 1
+        ;;
+    esac
+  else
+    echo "==> Continuing without agy (non-interactive). Install Antigravity to activate the plugin."
+  fi
+  echo ""
+fi
+
 if [ "${TARGET_MODE}" = "--workspace" ]; then
   DEST_DIR="${PWD}/.agents/plugins/agy-auto-mode"
   echo "==> Installing into workspace: ${DEST_DIR}"

@@ -6,15 +6,17 @@
   "allow": [
     "Inspection and read-only actions: viewing files, listing directories, search, documentation lookup",
     "Read-only shell utilities: ls, cat, head, tail, wc, stat, du, df, tree, find, grep, rg, sed -n, awk, jq, sort, uniq, cut, diff, which, date",
-    "Code modifications to files located strictly within trusted workspaces, including workspace-relative mkdir, touch, cp, mv, sed -i and output redirection",
+    "Code modifications to files located strictly within trusted workspaces or /tmp, including mkdir, touch, cp, mv, sed -i and output redirection",
     "Standard developer, build, test, and package management commands: npm, pnpm, yarn, bun, pip, python, pytest, cargo, go, tsc, make",
-    "Restoring already-declared dependencies from a committed manifest or lockfile: npm ci, npm install, pip install -r, poetry install, go mod download",
-    "Routine git queries and non-destructive local operations: git status, diff, log, branch, add, commit, stash, fetch, rev-parse, ls-files, blame, remote -v, config --get, and branch-shaped checkout/switch",
-    "Redirecting output to /dev/null or a workspace-relative file, and descriptor duplication such as 2>&1",
-    "Reading a local development server over loopback or a private subnet (plain curl fetches, no upload or file output)"
+    "Restoring and adding project dependencies: npm ci, npm install, pnpm add, yarn add, bun add, pip install, poetry add/install, cargo add, go get/mod",
+    "Executing inline interpreter code for data inspection, JSON manipulation, testing, and formatting: python -c, python3 -c, node -e, ruby -e (without credential or system file access)",
+    "Routine git queries and local operations: git status, diff, log, branch, add, commit, stash, fetch, merge, pull, rev-parse, ls-files, blame, remote -v, config --get, and branch-shaped checkout/switch",
+    "Removing workspace scratch files, temporary files, local build artifacts, and files in /tmp: rm <file>, rm -rf /tmp/..., rm -rf build, dist, target, .cache, __pycache__",
+    "Redirecting output to /dev/null, /tmp, or a workspace-relative file, and descriptor duplication such as 2>&1",
+    "Reading web resources, documentation, public APIs, and dev servers over HTTP/HTTPS via curl (plain GET fetches, no upload or shell piping)"
   ],
   "soft_deny": [
-    "File deletions or recursive directory removals (rm, rm -rf, shred)",
+    "Catastrophic, root, or whole-repository directory deletions (rm -rf /, rm -rf ~, rm -rf ., rm -rf /workspace, shred)",
     "Privileged system commands or privilege escalation (sudo, su, chown, chmod 777)",
     "Destructive git operations that discard uncommitted work or overwrite history: git push --force, git reset --hard, git clean -f, git restore, git stash drop/clear",
     "Checkout forms that discard uncommitted work: git checkout -- <path>, git checkout ., -f/--force, --discard-changes, --ours, --theirs",
@@ -22,11 +24,11 @@
     "git submodule update/foreach: fetches remote content and can execute hooks",
     "Git commands that rewrite repository configuration or remotes: git config <set>, git remote add/set-url",
     "Environment assignments that redirect which binary or interpreter hook runs: PATH, LD_PRELOAD, DYLD_*, NODE_OPTIONS, PYTHONPATH, BASH_ENV, GIT_SSH_COMMAND, GIT_EXTERNAL_DIFF, IFS",
-    "Installing new packages that are not already declared in the project manifest, and any global install (-g, --global)",
-    "Inline interpreter code (python -c, node -e) and text-tool programs that shell out (awk system(), sed e/w/f)",
+    "Global package installations that modify system-wide environments (-g, --global, --break-system-packages)",
+    "Inline interpreter code or scripts that attempt privilege escalation, exfiltrate private credentials, or modify system files",
     "Sourcing arbitrary shell scripts (source/. anything other than a virtualenv activate script)",
     "Piping untrusted remote scripts directly to shell (curl | sh, wget | bash)",
-    "Modifications, redirections or copies targeting sensitive system paths or any path outside workspace roots"
+    "Modifications, redirections or copies targeting sensitive system paths (~/.ssh, ~/.aws, /etc, /System) or external directories outside workspace roots and /tmp"
   ],
   "hard_deny": [
     "Data exfiltration: transferring credentials, private keys, or internal secrets to external unverified servers",
